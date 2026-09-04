@@ -1,0 +1,10 @@
+/target
+/tracks_viz
+/images
+/features_cache
+/matches_cache
+/depth_cache
+*.ply
+*.obj
+*.json
+/olddata
