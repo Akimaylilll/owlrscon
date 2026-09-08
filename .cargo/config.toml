@@ -1,0 +1,9 @@
+[alias]
+demo = "run --release -- -dir=./images -first_octave=0 -stage=coverage"
+
+#features/sift	SIFT 特征提取
+#matches/match	特征匹配
+#tracks/track	build_tracks
+#coverage	visualize_track_coverage_graph
+#sfm	run_incremental_sfm
+#mvs/all（默认）	全部（run_mvs_dense）
