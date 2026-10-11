@@ -1,3 +1,4 @@
+mod backend;
 mod imgproc;
 mod matching;
 mod mvs;
@@ -105,6 +106,8 @@ fn parse_args() -> (String, i32, Stage) {
 fn main() {
     let total_start = Instant::now();
 
+    backend::init();
+
     let (image_dir, first_octave, stage) = parse_args();
 
     let paths = load_image_paths(&image_dir);
@@ -136,7 +139,7 @@ fn main() {
         return;
     }
 
-    visualize_track_coverage_graph(&tracks, &features, &paths, "tracks_viz/coverage_graph.png");
+    visualize_track_coverage_graph(&tracks, &features, &paths, "coverage_graph.png");
     if stage <= Stage::Coverage {
         let total_elapsed = total_start.elapsed();
         println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());

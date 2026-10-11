@@ -1,10 +1,11 @@
 /target
-/tracks_viz
 /images
-/features_cache
-/matches_cache
-/depth_cache
+/cache
 *.ply
 *.obj
 *.json
-/olddata
+*.mtl
+*.png
+
+/.idea
+.DS_Store

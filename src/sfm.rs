@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use image::RgbImage;
 use nalgebra::{self as na, Matrix3, Matrix3x4, Vector3, SVD};
 use rand::prelude::*;
 use rand::rngs::StdRng;
+use rand::seq::index::sample;
 use rand::SeedableRng;
+use rayon::prelude::*;
 
 use crate::imgproc::feature_dimensions;
 use crate::matching::Match;
@@ -27,6 +30,15 @@ const INIT_NUM_TRIALS: usize = 3;
 
 const MAX_REG_TRIALS: usize = 3;
 const MAX_MODEL_OVERLAP: usize = 20;
+
+// 多子模型重建：图像对匹配数达到该阈值才作为子模型种子
+const SUB_MODEL_MIN_MATCHES: usize = 50;
+
+// 子模型合并：共享 track 数低于该阈值时不进行对齐（避免病态缩放）
+const MIN_MERGE_SHARED_TRACKS: usize = 20;
+
+// 增量注册时，每注册 N 张图才做一次全局 BA（局部 BA 每张都做），加速重建
+const GLOBAL_BA_EVERY: usize = 5;
 
 const ABS_POSE_MIN_NUM_INLIERS: usize = 30;
 const ABS_POSE_MAX_ERROR_PX: f64 = 12.0;
@@ -128,6 +140,7 @@ struct TwoViewGeometry {
 // ---------------------------------------------------------------------
 //  Calibration / EXIF
 // ---------------------------------------------------------------------
+#[derive(Clone)]
 pub(crate) struct CameraIntrinsics {
     pub(crate) k: Matrix3<f64>,
     has_prior_focal: bool,
@@ -154,12 +167,24 @@ impl CameraIntrinsics {
         let mut has_prior = false;
 
         if let Ok(data) = fs::read(path) {
-            if let Some(fl_mm) = read_exif_focal_length(&data) {
-                let sensor_w_mm = 6.2;
-                let f_from_exif = wf * fl_mm / sensor_w_mm;
+            // 优先用 35mm 等效焦距（EXIF 0xA405），与传感器尺寸无关、最可靠：
+            // f_px = 图像宽 × (focal35 / 36mm 全画幅宽)。避免依赖易错的传感器宽度猜测。
+            if let Some(fl35) = read_exif_focal_length_35mm(&data) {
+                let f_from_exif = wf * fl35 / 36.0;
                 if f_from_exif > 500.0 && f_from_exif < 100000.0 && f_from_exif > wf * 0.1 {
                     f_px = f_from_exif;
                     has_prior = true;
+                }
+            }
+            // 兜底：物理焦距(mm) + 传感器宽度，仅在没有 35mm 等效焦距时使用
+            if !has_prior {
+                if let Some(fl_mm) = read_exif_focal_length(&data) {
+                    let sensor_w_mm = 6.2;
+                    let f_from_exif = wf * fl_mm / sensor_w_mm;
+                    if f_from_exif > 500.0 && f_from_exif < 100000.0 && f_from_exif > wf * 0.1 {
+                        f_px = f_from_exif;
+                        has_prior = true;
+                    }
                 }
             }
         }
@@ -174,7 +199,7 @@ impl CameraIntrinsics {
     }
 }
 
-fn read_exif_focal_length(data: &[u8]) -> Option<f64> {
+fn read_exif_focal_tag(data: &[u8], target_tag: u16) -> Option<f64> {
     let mut pos = 0;
     while pos + 4 < data.len() {
         if data[pos] == 0xFF && data[pos + 1] == 0xE1 {
@@ -232,14 +257,22 @@ fn read_exif_focal_length(data: &[u8]) -> Option<f64> {
                 break;
             }
             let tag = read_u16(ep);
-            if tag == 0x920A || tag == 0xA405 {
-                let val_off = read_u32(ep + 8) as usize;
-                let vp = tiff_start + val_off;
-                if vp + 8 <= data.len() {
-                    let num = read_u32(vp) as f64;
-                    let den = read_u32(vp + 4) as f64;
-                    if den > 0.0 {
-                        return Some(num / den);
+            if tag == target_tag {
+                let typ = read_u16(ep + 2);
+                let count = read_u32(ep + 4);
+                if typ == 3 && count >= 1 {
+                    // SHORT：值内联存储在 4 字节值域的低 16 位（如 FocalLengthIn35mm）
+                    return Some(read_u16(ep + 8) as f64);
+                } else if typ == 5 && count >= 1 {
+                    // RATIONAL：值存于偏移处，8 字节 num/den（如 FocalLength）
+                    let val_off = read_u32(ep + 8) as usize;
+                    let vp = tiff_start + val_off;
+                    if vp + 8 <= data.len() {
+                        let num = read_u32(vp) as f64;
+                        let den = read_u32(vp + 4) as f64;
+                        if den > 0.0 {
+                            return Some(num / den);
+                        }
                     }
                 }
             }
@@ -267,6 +300,16 @@ fn read_exif_focal_length(data: &[u8]) -> Option<f64> {
         ep += 12;
     }
     None
+}
+
+/// 物理焦距(mm)，EXIF 0x920A。
+fn read_exif_focal_length(data: &[u8]) -> Option<f64> {
+    read_exif_focal_tag(data, 0x920A)
+}
+
+/// 35mm 等效焦距，EXIF 0xA405。
+fn read_exif_focal_length_35mm(data: &[u8]) -> Option<f64> {
+    read_exif_focal_tag(data, 0xA405)
 }
 
 fn img_file_stem(path: &str) -> String {
@@ -836,9 +879,7 @@ fn estimate_absolute_pose(
     };
 
     for _ in 0..RANSAC_ITERATIONS.min(1000) {
-        let mut indices: Vec<usize> = (0..n).collect();
-        indices.shuffle(&mut rng);
-        let sample: Vec<usize> = indices[..6].to_vec();
+        let sample: Vec<usize> = sample(&mut rng, n, 6).into_vec();
         let s3d: Vec<Vector3<f64>> = sample.iter().map(|&i| pts3d[i]).collect();
         let s2d: Vec<(f64, f64)> = sample.iter().map(|&i| pts2d[i]).collect();
         let (r, t) = solve_pnp_dlt(&s3d, &s2d, k_inv);
@@ -1275,6 +1316,18 @@ impl Sfm {
                 None => return SfmStatus::NoInitialPair,
             };
 
+        self.initialize_with_pair(first, second, &geometry, tracks, features, index)
+    }
+
+    fn initialize_with_pair(
+        &mut self,
+        first: usize,
+        second: usize,
+        geometry: &TwoViewGeometry,
+        tracks: &[Track],
+        features: &[ImageFeatures],
+        index: &HashMap<(usize, usize), Vec<(usize, usize)>>,
+    ) -> SfmStatus {
         self.cameras[first] = Some(CameraPose {
             r: Matrix3::identity(),
             t: Vector3::zeros(),
@@ -1328,42 +1381,43 @@ impl Sfm {
     //  Next image selection
     // -----------------------------------------------------------------
     fn find_next_images(&self, tracks: &[Track], features: &[ImageFeatures]) -> Vec<usize> {
-        let mut scored: Vec<(f64, usize)> = Vec::new();
-        for img in 0..self.num_images {
-            if self.cameras[img].is_some()
-                || self.filtered[img]
-                || self.reg_trials[img] >= MAX_REG_TRIALS
-            {
-                continue;
-            }
-            let visible = self.visible_points_count(tracks, img);
-            if visible < ABS_POSE_MIN_NUM_INLIERS {
-                continue;
-            }
-            let score = match IMAGE_SELECTION_METHOD {
-                ImageSelectionMethod::MaxVisiblePointsNum => visible as f64,
-                ImageSelectionMethod::MaxVisiblePointsRatio => {
-                    let total = features[img].keypoints.len().max(1);
-                    visible as f64 / total as f64
+        let mut scored: Vec<(f64, usize)> = (0..self.num_images)
+            .into_par_iter()
+            .filter(|&img| {
+                self.cameras[img].is_none()
+                    && !self.filtered[img]
+                    && self.reg_trials[img] < MAX_REG_TRIALS
+            })
+            .filter_map(|img| {
+                let visible = self.visible_points_count(tracks, img);
+                if visible < ABS_POSE_MIN_NUM_INLIERS {
+                    return None;
                 }
-                ImageSelectionMethod::MinUncertainty => {
-                    let mut s = 0.0;
-                    for (tid, &pidx) in &self.track_to_point {
-                        let track = &tracks[*tid];
-                        if track
-                            .observations
-                            .binary_search_by_key(&img, |&(im, _)| im)
-                            .is_ok()
-                        {
-                            s += 1.0 / (1.0 + self.points[pidx].error);
-                        }
+                let score = match IMAGE_SELECTION_METHOD {
+                    ImageSelectionMethod::MaxVisiblePointsNum => visible as f64,
+                    ImageSelectionMethod::MaxVisiblePointsRatio => {
+                        let total = features[img].keypoints.len().max(1);
+                        visible as f64 / total as f64
                     }
-                    s
-                }
-            };
-            let penalty = if self.reg_trials[img] > 0 { 1e6 } else { 0.0 };
-            scored.push((score - penalty, img));
-        }
+                    ImageSelectionMethod::MinUncertainty => {
+                        let mut s = 0.0;
+                        for (tid, &pidx) in &self.track_to_point {
+                            let track = &tracks[*tid];
+                            if track
+                                .observations
+                                .binary_search_by_key(&img, |&(im, _)| im)
+                                .is_ok()
+                            {
+                                s += 1.0 / (1.0 + self.points[pidx].error);
+                            }
+                        }
+                        s
+                    }
+                };
+                let penalty = if self.reg_trials[img] > 0 { 1e6 } else { 0.0 };
+                Some((score - penalty, img))
+            })
+            .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.into_iter().map(|(_, img)| img).collect()
     }
@@ -1587,27 +1641,36 @@ impl Sfm {
         features: &[ImageFeatures],
         _index: &HashMap<(usize, usize), Vec<(usize, usize)>>,
     ) {
-        for (track_id, track) in tracks.iter().enumerate() {
-            if self.track_to_point.contains_key(&track_id) {
-                continue;
-            }
-            if track
-                .observations
-                .binary_search_by_key(&img, |&(im, _)| im)
-                .is_err()
-            {
-                continue;
-            }
-            let mut obs: Vec<(usize, usize)> = Vec::new();
-            for &(im, kp) in &track.observations {
-                if self.cameras[im].is_some() {
-                    obs.push((im, kp));
+        // 并行计算各 track 的三角化结果（只读），再串行应用 push/insert 保序
+        let results: Vec<Option<Vector3<f64>>> = tracks
+            .par_iter()
+            .enumerate()
+            .map(|(track_id, track)| {
+                if self.track_to_point.contains_key(&track_id) {
+                    return None;
                 }
-            }
-            if obs.len() < 2 {
-                continue;
-            }
-            if let Some(pt) = self.triangulate_track(track_id, &obs, features) {
+                if track
+                    .observations
+                    .binary_search_by_key(&img, |&(im, _)| im)
+                    .is_err()
+                {
+                    return None;
+                }
+                let obs: Vec<(usize, usize)> = track
+                    .observations
+                    .iter()
+                    .filter(|(im, _)| self.cameras[*im].is_some())
+                    .copied()
+                    .collect();
+                if obs.len() < 2 {
+                    return None;
+                }
+                self.triangulate_track(track_id, &obs, features)
+            })
+            .collect();
+
+        for (track_id, pt) in results.into_iter().enumerate() {
+            if let Some(pt) = pt {
                 let pidx = self.points.len();
                 self.points.push(Point3D {
                     xyz: pt,
@@ -1660,42 +1723,59 @@ impl Sfm {
     }
 
     fn complete_tracks(&mut self, tracks: &[Track], features: &[ImageFeatures]) -> usize {
+        // 并行计算每点重三角化结果（只读），再串行应用与计数
+        let s = &*self;
+        let results: Vec<Option<Vector3<f64>>> = s
+            .points
+            .par_iter()
+            .enumerate()
+            .map(|(pidx, _pt)| {
+                if !s.point_is_valid(pidx) {
+                    return None;
+                }
+                let track_id = s.points[pidx].track_id;
+                let track = &tracks[track_id];
+                let obs: Vec<(usize, usize)> = track
+                    .observations
+                    .iter()
+                    .filter(|(im, _)| s.cameras[*im].is_some())
+                    .copied()
+                    .collect();
+                if obs.len() < 3 {
+                    return None;
+                }
+                s.triangulate_track(track_id, &obs, features)
+                    .and_then(|pt| {
+                        let mut errs: Vec<f64> = Vec::new();
+                        for &(im, kp) in &obs {
+                            let cam = s.cameras[im].as_ref().unwrap();
+                            let f = s.focals[im];
+                            if let Some((u, v, _)) =
+                                project_point(&cam.r, &cam.t, &pt, f, s.cx(), s.cy())
+                            {
+                                let kd = &features[im].keypoints[kp];
+                                errs.push(
+                                    ((u - kd.x as f64).powi(2) + (v - kd.y as f64).powi(2)).sqrt(),
+                                );
+                            }
+                        }
+                        if errs.is_empty() {
+                            return None;
+                        }
+                        errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let median_err = errs[errs.len() / 2];
+                        if median_err > COMPLETE_MAX_REPROJ_ERROR_PX {
+                            None
+                        } else {
+                            Some(pt)
+                        }
+                    })
+            })
+            .collect();
+
         let mut changed = 0usize;
-        for pidx in 0..self.points.len() {
-            if !self.point_is_valid(pidx) {
-                continue;
-            }
-            let track_id = self.points[pidx].track_id;
-            let track = &tracks[track_id];
-            let obs: Vec<(usize, usize)> = track
-                .observations
-                .iter()
-                .filter(|(im, _)| self.cameras[*im].is_some())
-                .copied()
-                .collect();
-            if obs.len() < 3 {
-                continue;
-            }
-            if let Some(pt) = self.triangulate_track(track_id, &obs, features) {
-                let mut errs: Vec<f64> = Vec::new();
-                for &(im, kp) in &obs {
-                    let cam = self.cameras[im].as_ref().unwrap();
-                    let f = self.focals[im];
-                    if let Some((u, v, _)) =
-                        project_point(&cam.r, &cam.t, &pt, f, self.cx(), self.cy())
-                    {
-                        let kd = &features[im].keypoints[kp];
-                        errs.push(((u - kd.x as f64).powi(2) + (v - kd.y as f64).powi(2)).sqrt());
-                    }
-                }
-                if errs.is_empty() {
-                    continue;
-                }
-                errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let median_err = errs[errs.len() / 2];
-                if median_err > COMPLETE_MAX_REPROJ_ERROR_PX {
-                    continue;
-                }
+        for (pidx, opt) in results.into_iter().enumerate() {
+            if let Some(pt) = opt {
                 if (pt - self.points[pidx].xyz).norm() > 1e-6 {
                     self.points[pidx].xyz = pt;
                     changed += 1;
@@ -1801,26 +1881,30 @@ impl Sfm {
     //  Filtering
     // -----------------------------------------------------------------
     fn filter_points3d(&mut self, tracks: &[Track], features: &[ImageFeatures]) -> usize {
-        let mut removed = 0usize;
-        for pidx in 0..self.points.len() {
-            if self.points[pidx].track_id == usize::MAX {
-                continue;
+        let cameras = &self.cameras;
+        let focals = &self.focals;
+        let cx = self.cx();
+        let cy = self.cy();
+        let removed = AtomicUsize::new(0);
+
+        self.points.par_iter_mut().for_each(|pt| {
+            if pt.track_id == usize::MAX {
+                return;
             }
-            let track_id = self.points[pidx].track_id;
-            let track = &tracks[track_id];
-            let pt = self.points[pidx].xyz;
+            let track = &tracks[pt.track_id];
+            let xyz = pt.xyz;
 
             let mut errs: Vec<f64> = Vec::new();
             let mut behind = 0usize;
             let mut reg_ims: Vec<usize> = Vec::new();
             for &(im, kp) in &track.observations {
-                if self.cameras[im].is_none() {
+                if cameras[im].is_none() {
                     continue;
                 }
                 reg_ims.push(im);
-                let cam = self.cameras[im].as_ref().unwrap();
-                let f = self.focals[im];
-                match project_point(&cam.r, &cam.t, &pt, f, self.cx(), self.cy()) {
+                let cam = cameras[im].as_ref().unwrap();
+                let f = focals[im];
+                match project_point(&cam.r, &cam.t, &xyz, f, cx, cy) {
                     Some((u, v, _)) => {
                         let kd = &features[im].keypoints[kp];
                         errs.push(((u - kd.x as f64).powi(2) + (v - kd.y as f64).powi(2)).sqrt());
@@ -1829,39 +1913,44 @@ impl Sfm {
                 }
             }
 
+            let invalidate = |pt: &mut Point3D| {
+                pt.track_id = usize::MAX;
+                pt.xyz = Vector3::zeros();
+                pt.error = f64::MAX;
+                removed.fetch_add(1, Ordering::Relaxed);
+            };
+
             let valid_obs = errs.len();
             if valid_obs < 2 {
-                self.invalidate_point(pidx);
-                removed += 1;
-                continue;
+                invalidate(pt);
+                return;
             }
 
             errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let median_err = errs[errs.len() / 2];
-            self.points[pidx].error = median_err;
+            pt.error = median_err;
 
             if behind > valid_obs {
-                self.invalidate_point(pidx);
-                removed += 1;
-                continue;
+                invalidate(pt);
+                return;
             }
 
             if reg_ims.len() >= 2 {
-                let c0 = self.cameras[reg_ims[0]].as_ref().unwrap();
-                let c1 = self.cameras[reg_ims[1]].as_ref().unwrap();
-                let angle = calc_triangulation_angle(&c0.r, &c0.t, &c1.r, &c1.t, &pt);
+                let c0 = cameras[reg_ims[0]].as_ref().unwrap();
+                let c1 = cameras[reg_ims[1]].as_ref().unwrap();
+                let angle = calc_triangulation_angle(&c0.r, &c0.t, &c1.r, &c1.t, &xyz);
                 if angle < FILTER_MIN_TRI_ANGLE_DEG.to_radians() {
-                    self.invalidate_point(pidx);
-                    removed += 1;
-                    continue;
+                    invalidate(pt);
+                    return;
                 }
             }
 
             if median_err > FILTER_MAX_REPROJ_ERROR_PX * 2.0 {
-                self.invalidate_point(pidx);
-                removed += 1;
+                invalidate(pt);
             }
-        }
+        });
+
+        let removed = removed.into_inner();
         if removed > 0 {
             self.rebuild_track_to_point();
         }
@@ -1919,29 +2008,30 @@ impl Sfm {
     }
 
     fn update_point_errors(&mut self, tracks: &[Track], features: &[ImageFeatures]) {
-        for pidx in 0..self.points.len() {
-            if self.points[pidx].track_id == usize::MAX {
-                continue;
+        let cameras = &self.cameras;
+        let focals = &self.focals;
+        let cx = self.cx();
+        let cy = self.cy();
+        self.points.par_iter_mut().for_each(|pt| {
+            if pt.track_id == usize::MAX {
+                return;
             }
-            let track_id = self.points[pidx].track_id;
-            let track = &tracks[track_id];
-            let pt = self.points[pidx].xyz;
+            let track = &tracks[pt.track_id];
+            let xyz = pt.xyz;
             let mut sum = 0.0;
             let mut cnt = 0usize;
             for &(im, kp) in &track.observations {
-                if let Some(cam) = &self.cameras[im] {
-                    let f = self.focals[im];
-                    if let Some((u, v, _)) =
-                        project_point(&cam.r, &cam.t, &pt, f, self.cx(), self.cy())
-                    {
+                if let Some(cam) = &cameras[im] {
+                    let f = focals[im];
+                    if let Some((u, v, _)) = project_point(&cam.r, &cam.t, &xyz, f, cx, cy) {
                         let kd = &features[im].keypoints[kp];
                         sum += ((u - kd.x as f64).powi(2) + (v - kd.y as f64).powi(2)).sqrt();
                         cnt += 1;
                     }
                 }
             }
-            self.points[pidx].error = if cnt > 0 { sum / cnt as f64 } else { f64::MAX };
-        }
+            pt.error = if cnt > 0 { sum / cnt as f64 } else { f64::MAX };
+        });
     }
 
     // -----------------------------------------------------------------
@@ -1986,28 +2076,29 @@ impl Sfm {
     }
 
     fn find_local_bundle(&self, tracks: &[Track], img: usize, num: usize) -> Vec<usize> {
-        let mut scores: Vec<(usize, usize)> = Vec::new();
-        for other in self.registered_images() {
-            if other == img {
-                continue;
-            }
-            let mut shared = 0usize;
-            for (tid, _pidx) in &self.track_to_point {
-                let track = &tracks[*tid];
-                let in_a = track
-                    .observations
-                    .binary_search_by_key(&img, |&(im, _)| im)
-                    .is_ok();
-                let in_b = track
-                    .observations
-                    .binary_search_by_key(&other, |&(im, _)| im)
-                    .is_ok();
-                if in_a && in_b {
-                    shared += 1;
+        let registered = self.registered_images();
+        let mut scores: Vec<(usize, usize)> = registered
+            .into_par_iter()
+            .filter(|&other| other != img)
+            .map(|other| {
+                let mut shared = 0usize;
+                for (tid, _pidx) in &self.track_to_point {
+                    let track = &tracks[*tid];
+                    let in_a = track
+                        .observations
+                        .binary_search_by_key(&img, |&(im, _)| im)
+                        .is_ok();
+                    let in_b = track
+                        .observations
+                        .binary_search_by_key(&other, |&(im, _)| im)
+                        .is_ok();
+                    if in_a && in_b {
+                        shared += 1;
+                    }
                 }
-            }
-            scores.push((shared, other));
-        }
+                (shared, other)
+            })
+            .collect();
         scores.sort_by(|a, b| b.0.cmp(&a.0));
         let mut local = vec![img];
         for (_, o) in scores.into_iter().take(num - 1) {
@@ -2123,7 +2214,7 @@ fn bundle_adjust(
     if np == 0 {
         return;
     }
-    let ncp = nc * 6;
+    let ncp = nc * 7;
     let cx = sfm.cx();
     let cy = sfm.cy();
 
@@ -2131,9 +2222,9 @@ fn bundle_adjust(
     let mut best_cost = f64::MAX;
 
     for _it in 0..max_iterations {
-        let mut u = vec![na::SMatrix::<f64, 6, 6>::zeros(); nc];
-        let mut ec = vec![na::SVector::<f64, 6>::zeros(); nc];
-        let mut wpairs: Vec<Vec<(usize, na::SMatrix<f64, 6, 3>)>> = vec![Vec::new(); nc];
+        let mut u = vec![na::SMatrix::<f64, 7, 7>::zeros(); nc];
+        let mut ec = vec![na::SVector::<f64, 7>::zeros(); nc];
+        let mut wpairs: Vec<Vec<(usize, na::SMatrix<f64, 7, 3>)>> = vec![Vec::new(); nc];
         let mut vpinv = vec![na::SMatrix::<f64, 3, 3>::zeros(); np];
         let mut ep = vec![na::SVector::<f64, 3>::zeros(); np];
         let mut total_cost = 0.0f64;
@@ -2165,7 +2256,7 @@ fn bundle_adjust(
                 let du = (f * zi, 0.0, -f * xc.x * zi * zi);
                 let dv = (0.0, f * zi, -f * xc.y * zi * zi);
                 let sk = skew_symmetric(&(cam.r * pt));
-                let mut jc = na::SMatrix::<f64, 2, 6>::zeros();
+                let mut jc = na::SMatrix::<f64, 2, 7>::zeros();
                 for k in 0..3 {
                     let col = sk.column(k);
                     jc[(0, k)] = -(du.0 * col.x + du.1 * col.y + du.2 * col.z);
@@ -2177,6 +2268,8 @@ fn bundle_adjust(
                 jc[(1, 3)] = dv.0;
                 jc[(1, 4)] = dv.1;
                 jc[(1, 5)] = dv.2;
+                jc[(0, 6)] = xc.x * zi;
+                jc[(1, 6)] = xc.y * zi;
 
                 let mut jp = na::SMatrix::<f64, 2, 3>::zeros();
                 let r = &cam.r;
@@ -2208,18 +2301,18 @@ fn bundle_adjust(
         let mut s: na::DMatrix<f64> = na::DMatrix::zeros(ncp, ncp);
         let mut es = na::DVector::<f64>::zeros(ncp);
         for ci in 0..nc {
-            let cr = ci * 6;
-            for r in 0..6 {
-                for c in 0..6 {
+            let cr = ci * 7;
+            for r in 0..7 {
+                for c in 0..7 {
                     s[(cr + r, cr + c)] += u[ci][(r, c)];
                 }
             }
-            for r in 0..6 {
+            for r in 0..7 {
                 es[cr + r] += ec[ci][r];
             }
             for (pi, w) in &wpairs[ci] {
-                for wr in 0..6 {
-                    for wc in 0..6 {
+                for wr in 0..7 {
+                    for wc in 0..7 {
                         let mut sum = 0.0;
                         for k in 0..3 {
                             for l in 0..3 {
@@ -2240,17 +2333,22 @@ fn bundle_adjust(
         }
         for ci in 0..nc {
             if fixed[ci] {
-                let cr = ci * 6;
+                let cr = ci * 7;
                 for d in 0..6 {
                     s[(cr + d, cr + d)] = 1e10;
                     es[cr + d] = 0.0;
                 }
             }
+            // 有 EXIF 焦距先验的相机：焦距维度固定；否则焦距参与自标定
+            if sfm.has_prior_focal[active_cams[ci]] {
+                s[(ci * 7 + 6, ci * 7 + 6)] = 1e10;
+                es[ci * 7 + 6] = 0.0;
+            }
         }
         for d in 0..ncp {
             s[(d, d)] += lambda * s[(d, d)].abs().max(1e-6);
         }
-        let delta_c = match s.clone().lu().solve(&(-es)) {
+        let delta_c = match s.lu().solve(&(-es)) {
             Some(d) => d,
             None => {
                 lambda *= 3.0;
@@ -2262,37 +2360,44 @@ fn bundle_adjust(
             .iter()
             .map(|&im| sfm.cameras[im].clone().unwrap())
             .collect();
+        let backup_focals: Vec<f64> = active_cams.iter().map(|&im| sfm.focals[im]).collect();
         let backup_pts: Vec<Vector3<f64>> = pts.iter().map(|&pidx| sfm.points[pidx].xyz).collect();
 
         for ci in 0..nc {
             if fixed[ci] {
                 continue;
             }
-            let cam = sfm.cameras[active_cams[ci]].as_mut().unwrap();
-            let cr = ci * 6;
+            let im = active_cams[ci];
+            let cam = sfm.cameras[im].as_mut().unwrap();
+            let cr = ci * 7;
             let dw = Vector3::new(delta_c[cr], delta_c[cr + 1], delta_c[cr + 2]);
             let dt = Vector3::new(delta_c[cr + 3], delta_c[cr + 4], delta_c[cr + 5]);
             cam.r = so3_exp(&dw) * cam.r;
             cam.t += dt;
+            // 焦距自标定：无 EXIF 先验时更新，并限制在合理范围内防止发散
+            if !sfm.has_prior_focal[im] {
+                let f = sfm.focals[im];
+                sfm.focals[im] =
+                    (f + delta_c[cr + 6]).clamp(f * MIN_FOCAL_LENGTH_RATIO, f * MAX_FOCAL_LENGTH_RATIO);
+            }
         }
-        for pi in 0..np {
-            let pidx = pts[pi];
-            let mut dp = na::SVector::<f64, 3>::zeros();
-            for ci in 0..nc {
-                for (pj, w) in &wpairs[ci] {
-                    if *pj == pi {
-                        for rc in 0..3 {
-                            for row in 0..6 {
-                                dp[rc] += w[(row, rc)] * delta_c[ci * 6 + row];
-                            }
-                        }
+        // 先一趟按 wpairs 累加每个点的 dp（O(n_obs)，避免逐点重复扫描）
+        let mut dp = vec![na::SVector::<f64, 3>::zeros(); np];
+        for ci in 0..nc {
+            for (pj, w) in &wpairs[ci] {
+                for rc in 0..3 {
+                    for row in 0..7 {
+                        dp[*pj][rc] += w[(row, rc)] * delta_c[ci * 7 + row];
                     }
                 }
             }
+        }
+        for pi in 0..np {
+            let pidx = pts[pi];
             let mut corr = na::SVector::<f64, 3>::zeros();
             for r in 0..3 {
                 for c in 0..3 {
-                    corr[r] += vpinv[pi][(r, c)] * (-ep[pi][c] - dp[c]);
+                    corr[r] += vpinv[pi][(r, c)] * (-ep[pi][c] - dp[pi][c]);
                 }
             }
             sfm.points[pidx].xyz += Vector3::new(corr[0], corr[1], corr[2]);
@@ -2329,6 +2434,7 @@ fn bundle_adjust(
         } else {
             for (ci, &im) in active_cams.iter().enumerate() {
                 sfm.cameras[im] = Some(backup_cams[ci].clone());
+                sfm.focals[im] = backup_focals[ci];
             }
             for (pi, &pidx) in pts.iter().enumerate() {
                 sfm.points[pidx].xyz = backup_pts[pi];
@@ -2347,21 +2453,15 @@ fn bundle_adjust(
 // ---------------------------------------------------------------------
 //  Reconstruct (top-level control flow)
 // ---------------------------------------------------------------------
-fn reconstruct_sub_model(
+fn grow_sub_model(
     sfm: &mut Sfm,
     index: &HashMap<(usize, usize), Vec<(usize, usize)>>,
     features: &[ImageFeatures],
     tracks: &[Track],
     paths: &[String],
-    min_num_inliers: usize,
-    min_tri_angle: f64,
-) -> SfmStatus {
-    let status = sfm.initialize(index, features, tracks, min_num_inliers, min_tri_angle);
-    if status != SfmStatus::Success {
-        return status;
-    }
-
+) {
     let mut prev_success = true;
+    let mut reg_count = 0usize;
     loop {
         let mut success = false;
         let mut last_img = None;
@@ -2389,7 +2489,10 @@ fn reconstruct_sub_model(
             let img = last_img.unwrap();
             sfm.triangulate_image(img, tracks, features, index);
             sfm.iterative_refinement(tracks, features, false, Some(img));
-            sfm.iterative_refinement(tracks, features, true, None);
+            reg_count += 1;
+            if reg_count % GLOBAL_BA_EVERY == 0 {
+                sfm.iterative_refinement(tracks, features, true, None);
+            }
             let registered = sfm.num_registered();
             println!(
                 "  [{:3}/{:3}] registered {} ({})  {} points",
@@ -2435,7 +2538,26 @@ fn reconstruct_sub_model(
         prev_success = success;
     }
 
+    // 结束前做一次全局 BA 优化
+    sfm.iterative_refinement(tracks, features, true, None);
     sfm.update_point_errors(tracks, features);
+}
+
+fn reconstruct_sub_model(
+    sfm: &mut Sfm,
+    index: &HashMap<(usize, usize), Vec<(usize, usize)>>,
+    features: &[ImageFeatures],
+    tracks: &[Track],
+    paths: &[String],
+    min_num_inliers: usize,
+    min_tri_angle: f64,
+) -> SfmStatus {
+    let status = sfm.initialize(index, features, tracks, min_num_inliers, min_tri_angle);
+    if status != SfmStatus::Success {
+        return status;
+    }
+
+    grow_sub_model(sfm, index, features, tracks, paths);
     SfmStatus::Success
 }
 
@@ -2477,6 +2599,236 @@ fn reconstruct(
         min_num_inliers /= 2;
         min_tri_angle /= 2.0;
     }
+}
+
+/// Umeyama 相似变换（sim3）：求 `dst ≈ scale * rot * src + trans`。
+fn umeyama_sim3(
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+) -> Option<(f64, Matrix3<f64>, Vector3<f64>)> {
+    let n = src.len();
+    if n < 3 {
+        return None;
+    }
+    let mx = src.iter().copied().sum::<Vector3<f64>>() / n as f64;
+    let my = dst.iter().copied().sum::<Vector3<f64>>() / n as f64;
+    let mut cov = Matrix3::zeros();
+    let mut var = 0.0f64;
+    for (x, y) in src.iter().zip(dst.iter()) {
+        let xc = x - mx;
+        let yc = y - my;
+        cov += yc * xc.transpose();
+        var += xc.norm_squared();
+    }
+    let svd = SVD::new(cov, true, true);
+    let u = svd.u?;
+    let v_t = svd.v_t?;
+    let d = svd.singular_values;
+    let det = (u * v_t).determinant();
+    let sign = if det < 0.0 { -1.0 } else { 1.0 };
+    let mut s_corr = Matrix3::identity();
+    s_corr[(2, 2)] = sign;
+    let rot = u * s_corr * v_t;
+    let scale = (d[0] + d[1] + sign * d[2]) / var.max(1e-12);
+    let trans = my - scale * (rot * mx);
+    Some((scale, rot, trans))
+}
+
+/// 鲁棒相似变换：用 RANSAC 剔除离群共享点后求 `dst ≈ scale * rot * src + trans`。
+///
+/// 共享点过少（< [`MIN_MERGE_SHARED_TRACKS`]）或内点不足时返回 `None`，
+/// 避免用病态/污染的锚点算出错误 scale 导致子模型被缩放嵌套。
+fn robust_sim3(
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+) -> Option<(f64, Matrix3<f64>, Vector3<f64>)> {
+    let n = src.len();
+    if n < MIN_MERGE_SHARED_TRACKS {
+        return None;
+    }
+
+    // 自适应内点阈值：场景已 normalize 到尺度≈1，取中位半径的 2%
+    let mut radii: Vec<f64> = src.iter().map(|p| p.norm()).collect();
+    radii.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = radii[radii.len() / 2];
+    let threshold = (0.02 * med).max(1e-3);
+
+    let mut rng = StdRng::seed_from_u64(RANSAC_SEED);
+    let mut best_inliers: Vec<usize> = Vec::new();
+    let mut best_sim: Option<(f64, Matrix3<f64>, Vector3<f64>)> = None;
+
+    for _ in 0..100 {
+        let sample = sample(&mut rng, n, 3).into_vec();
+        let s: Vec<Vector3<f64>> = sample.iter().map(|&i| src[i]).collect();
+        let d: Vec<Vector3<f64>> = sample.iter().map(|&i| dst[i]).collect();
+        let (scale, rot, trans) = match umeyama_sim3(&s, &d) {
+            Some(v) => v,
+            None => continue,
+        };
+        let mut inliers = Vec::new();
+        for i in 0..n {
+            let pred = scale * (rot * src[i]) + trans;
+            if (pred - dst[i]).norm() < threshold {
+                inliers.push(i);
+            }
+        }
+        if inliers.len() > best_inliers.len() {
+            best_inliers = inliers;
+            best_sim = Some((scale, rot, trans));
+        }
+    }
+
+    if best_inliers.len() < MIN_MERGE_SHARED_TRACKS {
+        return None;
+    }
+
+    // 用全部内点重跑 Umeyama 精化
+    let s: Vec<Vector3<f64>> = best_inliers.iter().map(|&i| src[i]).collect();
+    let d: Vec<Vector3<f64>> = best_inliers.iter().map(|&i| dst[i]).collect();
+    let refined = umeyama_sim3(&s, &d);
+    if refined.is_some() {
+        refined
+    } else {
+        best_sim
+    }
+}
+
+/// 合并多个子模型：通过共享 track 的 3D 点计算相似变换对齐到最大子模型。
+fn merge_submodels(mut submodels: Vec<Sfm>) -> Sfm {
+    submodels.sort_by_key(|s| {
+        std::cmp::Reverse(s.points.iter().filter(|p| p.track_id != usize::MAX).count())
+    });
+    let mut merged = submodels.remove(0);
+
+    for mut sub in submodels {
+        // 收集共享 track 的 3D 点对
+        let mut src: Vec<Vector3<f64>> = Vec::new();
+        let mut dst: Vec<Vector3<f64>> = Vec::new();
+        for (tid, &pidx_sub) in &sub.track_to_point {
+            if let Some(&pidx_merged) = merged.track_to_point.get(tid) {
+                if sub.point_is_valid(pidx_sub) && merged.point_is_valid(pidx_merged) {
+                    src.push(sub.points[pidx_sub].xyz);
+                    dst.push(merged.points[pidx_merged].xyz);
+                }
+            }
+        }
+        let (scale, rot, trans) = match robust_sim3(&src, &dst) {
+            Some(v) => v,
+            None => {
+                println!(
+                    "  Skip merging sub-model (shared tracks={} < {}), leave it out",
+                    src.len(),
+                    MIN_MERGE_SHARED_TRACKS
+                );
+                continue;
+            }
+        };
+        println!(
+            "  Merge sub-model: shared tracks={} scale={:.3}",
+            src.len(),
+            scale
+        );
+
+        // 变换子模型相机位姿：C' = s R C + t，R' = R R_sim^T
+        for cam in sub.cameras.iter_mut().flatten() {
+            cam.r = cam.r * rot.transpose();
+            cam.t = scale * cam.t - cam.r * trans;
+        }
+        // 变换子模型 3D 点
+        for p in sub.points.iter_mut() {
+            if p.track_id != usize::MAX {
+                p.xyz = scale * (rot * p.xyz) + trans;
+            }
+        }
+
+        // 合并相机（只补未注册的）
+        for i in 0..merged.num_images {
+            if merged.cameras[i].is_none() && sub.cameras[i].is_some() {
+                merged.cameras[i] = sub.cameras[i].clone();
+            }
+        }
+        // 合并点（去重共享 track）
+        for (tid, &pidx_sub) in &sub.track_to_point {
+            if sub.point_is_valid(pidx_sub) && !merged.track_to_point.contains_key(tid) {
+                merged.points.push(sub.points[pidx_sub].clone());
+                let new_pidx = merged.points.len() - 1;
+                merged.track_to_point.insert(*tid, new_pidx);
+            }
+        }
+    }
+    merged
+}
+
+/// 多子模型重建：从多个强连接图像对分别启动增量重建，再按共享 track 合并。
+fn reconstruct_multi_model(
+    sfm: &mut Sfm,
+    index: &HashMap<(usize, usize), Vec<(usize, usize)>>,
+    features: &[ImageFeatures],
+    tracks: &[Track],
+    paths: &[String],
+) {
+    let min_num_inliers = INIT_MIN_NUM_INLIERS;
+    let min_tri_angle = INIT_MIN_TRI_ANGLE_DEG.to_radians();
+
+    // 1. 收集子模型种子（强连接图像对）
+    let mut seeds: Vec<((usize, usize), usize)> = index
+        .iter()
+        .filter(|&(_, v)| v.len() >= SUB_MODEL_MIN_MATCHES)
+        .map(|(&(a, b), v)| ((a, b), v.len()))
+        .collect();
+    seeds.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+
+    // 2. 从每个种子重建一个子模型
+    let mut registered_global = vec![false; sfm.num_images];
+    let mut submodels: Vec<Sfm> = Vec::new();
+
+    for ((a, b), _n) in seeds {
+        if registered_global[a] || registered_global[b] {
+            continue;
+        }
+        let mut sub = Sfm::new(sfm.num_images, sfm.intrinsics.clone());
+        let geometry = match sub.estimate_initial_two_view_geometry(
+            a,
+            b,
+            index,
+            features,
+            min_num_inliers,
+            min_tri_angle,
+        ) {
+            Some(g) => g,
+            None => continue,
+        };
+        if sub.initialize_with_pair(a, b, &geometry, tracks, features, index) != SfmStatus::Success
+        {
+            continue;
+        }
+        grow_sub_model(&mut sub, index, features, tracks, paths);
+        let reg = sub.registered_images();
+        for img in &reg {
+            registered_global[*img] = true;
+        }
+        let np = sub
+            .points
+            .iter()
+            .filter(|p| p.track_id != usize::MAX)
+            .count();
+        println!(
+            "  Sub-model seeded ({},{}) -> {} images, {} points",
+            a,
+            b,
+            reg.len(),
+            np
+        );
+        submodels.push(sub);
+    }
+
+    if submodels.is_empty() {
+        reconstruct(sfm, index, features, tracks, paths);
+        return;
+    }
+
+    println!("\n  Merging {} sub-models...", submodels.len());
+    *sfm = merge_submodels(submodels);
 }
 
 fn build_correspondence_index(matches: &[Match]) -> HashMap<(usize, usize), Vec<(usize, usize)>> {
@@ -2522,7 +2874,7 @@ pub(crate) fn run_incremental_sfm(
     println!("Correspondence graph: {} image pairs", index.len(),);
 
     let mut sfm = Sfm::new(paths.len(), intrinsics);
-    reconstruct(&mut sfm, &index, features, tracks, paths);
+    reconstruct_multi_model(&mut sfm, &index, features, tracks, paths);
 
     let registered = sfm.num_registered();
     println!(

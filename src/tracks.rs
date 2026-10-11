@@ -2,17 +2,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::time::Instant;
 
-use image::{Rgb, RgbImage};
-use imageproc::drawing;
-use nalgebra::{Matrix3, Vector3};
-use serde::Deserialize;
+use image::{GenericImageView, Rgb, RgbImage};
 
+use crate::imgproc::feature_dimensions;
 use crate::matching::Match;
-use crate::sfm::camera_center;
-use crate::types::{
-    ImageFeatures, MAX_KEYPOINTS_PER_IMAGE, MIN_TRACK_LENGTH, RATIO_THRESHOLD, SLIDING_WINDOW,
-    SNAKE_GAP_THRESHOLD,
-};
+use crate::types::{ImageFeatures, MIN_TRACK_LENGTH, SNAKE_GAP_THRESHOLD};
 
 pub(crate) struct Track {
     pub(crate) observations: Vec<(usize, usize)>,
@@ -153,44 +147,28 @@ pub(crate) fn build_tracks(matches: &[Match], features: &[ImageFeatures]) -> Vec
     tracks
 }
 
-#[derive(Debug, Deserialize)]
-struct CameraPoseEntry {
-    image: String,
-    #[serde(rename = "R")]
-    r: [[f64; 3]; 3],
-    #[serde(rename = "t")]
-    t: [f64; 3],
-}
+/// 匹配点对过少时视为无有效重叠。
+const MIN_PAIR_MATCHES: usize = 3;
+/// 重叠比例低于此阈值时该图对不绘制重叠（脚印相切）。
+const MIN_OVERLAP: f32 = 0.05;
 
-#[derive(Debug, Deserialize)]
-struct CameraPosesFile {
-    poses: Vec<CameraPoseEntry>,
-}
+/// 合成飞行高度（单位空间，脚印高为 1）。
+const Z_CAM: f32 = 1.5;
+/// 中间层高度比例。
+const MID_T: f32 = 0.5;
+/// 中间层缩放比例。
+const MID_S: f32 = 0.25;
+/// 等轴测投影角度（度）。
+const ISO_ALPHA_DEG: f32 = 30.0;
+/// 高度夸张系数。
+const ISO_K: f32 = 0.6;
 
-/// 热力图颜色映射
-fn heat_color(t: f32) -> Rgb<u8> {
-    let t = t.clamp(0.0, 1.0);
-    let r = if t < 0.5 {
-        (t * 2.0 * 255.0) as u8
-    } else {
-        255
-    };
-    let g = if t < 0.5 {
-        100
-    } else {
-        ((1.0 - (t - 0.5) * 2.0) * 155.0 + 100.0) as u8
-    };
-    let b = ((1.0 - t) * 255.0) as u8;
-    Rgb([r, g, b])
-}
+/// 图像对 -> 匹配点坐标列表：`(x_lo, y_lo, x_hi, y_hi)`。
+type PairPoints = HashMap<(usize, usize), Vec<(f32, f32, f32, f32)>>;
 
-/// 从文件名序列号推断飞行条带，返回蛇形（来回）布局的节点位置
-fn compute_snake_positions(paths: &[String], canvas_size: u32, margin: u32) -> Vec<(f32, f32)> {
+/// 从文件名序列号推断飞行条带切分，返回每个条带包含的图像索引（按飞行顺序）。
+fn infer_strips(paths: &[String]) -> Vec<Vec<usize>> {
     let n = paths.len();
-    if n == 0 {
-        return Vec::new();
-    }
-
     let seq: Vec<Option<i64>> = paths
         .iter()
         .map(|p| {
@@ -220,32 +198,289 @@ fn compute_snake_positions(paths: &[String], canvas_size: u32, margin: u32) -> V
     if !cur.is_empty() {
         strips.push(cur);
     }
-
-    let rows = strips.len().max(1);
-    let usable_w = (canvas_size - 2 * margin) as f32;
-    let usable_h = (canvas_size - 2 * margin) as f32;
-    let row_h = usable_h / rows as f32;
-
-    let mut positions = vec![(0.0f32, 0.0f32); n];
-    for (r, strip) in strips.iter().enumerate() {
-        let k = strip.len();
-        let col_w = usable_w / k.max(1) as f32;
-        let y = margin as f32 + row_h * r as f32 + row_h / 2.0;
-        for (ci, &idx) in strip.iter().enumerate() {
-            let col = if r % 2 == 0 { ci } else { k - 1 - ci };
-            let x = margin as f32 + col_w * col as f32 + col_w / 2.0;
-            positions[idx] = (x, y);
-        }
-    }
-
-    positions
+    strips
 }
 
-/// 轨迹覆盖图：节点布局反映无人机飞行路径（俯视图相机位姿或蛇形条带）。
+/// 收集所有图像对之间的匹配特征点坐标。
 ///
-/// 若存在 `camera_poses.json` 则按相机中心的 XY 平面俯视投影布局，
-/// 否则按文件名序列号推断飞行条带做蛇形布局；边表示两图像间共享
-/// 的 Track 数量，节点大小表示关键点数量。
+/// 键为 `(min, max)` 图像索引，值为 `(x_lo, y_lo, x_hi, y_hi)` 列表，其中
+/// lo/hi 分别对应索引较小/较大的图像；坐标来自关键点在特征提取帧的像素位置。
+fn collect_pair_points(tracks: &[Track], features: &[ImageFeatures]) -> PairPoints {
+    let mut map: PairPoints = HashMap::new();
+    for track in tracks {
+        let obs = &track.observations;
+        for a in 0..obs.len() {
+            for b in (a + 1)..obs.len() {
+                let (ia, ka) = obs[a];
+                let (ib, kb) = obs[b];
+                let (xa, ya) = (features[ia].keypoints[ka].x, features[ia].keypoints[ka].y);
+                let (xb, yb) = (features[ib].keypoints[kb].x, features[ib].keypoints[kb].y);
+                let (lo, hi, entry) = if ia <= ib {
+                    (ia, ib, (xa, ya, xb, yb))
+                } else {
+                    (ib, ia, (xb, yb, xa, ya))
+                };
+                map.entry((lo, hi)).or_default().push(entry);
+            }
+        }
+    }
+    map
+}
+
+/// 浮点中位数。
+fn median(vals: &[f32]) -> Option<f32> {
+    if vals.is_empty() {
+        return None;
+    }
+    let mut v = vals.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = v.len() / 2;
+    Some(if v.len() % 2 == 0 {
+        (v[mid - 1] + v[mid]) * 0.5
+    } else {
+        v[mid]
+    })
+}
+
+/// 判断主飞行轴是否沿图像 x 轴（横向条带），否则为纵向。
+fn is_horizontal_flight(pair_points: &PairPoints) -> bool {
+    let mut sum_dx = 0.0f64;
+    let mut sum_dy = 0.0f64;
+    for pts in pair_points.values() {
+        for &(xl, yl, xh, yh) in pts {
+            sum_dx += (xl - xh).abs() as f64;
+            sum_dy += (yl - yh).abs() as f64;
+        }
+    }
+    sum_dx >= sum_dy
+}
+
+/// 用匹配点在两图中各自覆盖范围的重合比例估算两图重叠比例。
+///
+/// `axis_is_x` 为 true 时沿 x 轴（前向重叠），否则沿 y 轴（侧向重叠）；`extent`
+/// 为该轴的图像尺寸（关键点帧）。匹配点过少或无匹配时返回 `None`。
+fn overlap_fraction(
+    pair_points: &PairPoints,
+    a: usize,
+    b: usize,
+    axis_is_x: bool,
+    extent: f32,
+) -> Option<f32> {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let pts = pair_points.get(&(lo, hi))?;
+    if pts.len() < MIN_PAIR_MATCHES {
+        return None;
+    }
+
+    let mut lo_a = f32::MAX;
+    let mut hi_a = f32::MIN;
+    let mut lo_b = f32::MAX;
+    let mut hi_b = f32::MIN;
+    for &(xl, yl, xh, yh) in pts {
+        let (ca, cb) = match (axis_is_x, a == lo) {
+            (true, true) => (xl, xh),
+            (true, false) => (xh, xl),
+            (false, true) => (yl, yh),
+            (false, false) => (yh, yl),
+        };
+        lo_a = lo_a.min(ca);
+        hi_a = hi_a.max(ca);
+        lo_b = lo_b.min(cb);
+        hi_b = hi_b.max(cb);
+    }
+    let shared = ((hi_a - lo_a) + (hi_b - lo_b)) * 0.5;
+    Some((shared / extent).clamp(0.0, 1.0))
+}
+
+/// 用匹配点对拟合 2D 相似变换，估计两图相对旋转角（Procrustes）。
+fn relative_yaw(pair_points: &PairPoints, a: usize, b: usize) -> f32 {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let Some(pts) = pair_points.get(&(lo, hi)) else {
+        return 0.0;
+    };
+    if pts.len() < MIN_PAIR_MATCHES {
+        return 0.0;
+    }
+    let n = pts.len() as f32;
+    let mut mx_a = 0.0f32;
+    let mut my_a = 0.0f32;
+    let mut mx_b = 0.0f32;
+    let mut my_b = 0.0f32;
+    for &(xl, yl, xh, yh) in pts {
+        let (xa, ya, xb, yb) = if a == lo {
+            (xl, yl, xh, yh)
+        } else {
+            (xh, yh, xl, yl)
+        };
+        mx_a += xa;
+        my_a += ya;
+        mx_b += xb;
+        my_b += yb;
+    }
+    mx_a /= n;
+    my_a /= n;
+    mx_b /= n;
+    my_b /= n;
+
+    let mut dot = 0.0f32;
+    let mut cross = 0.0f32;
+    for &(xl, yl, xh, yh) in pts {
+        let (xa, ya, xb, yb) = if a == lo {
+            (xl, yl, xh, yh)
+        } else {
+            (xh, yh, xl, yl)
+        };
+        let dax = xa - mx_a;
+        let day = ya - my_a;
+        let dbx = xb - mx_b;
+        let dby = yb - my_b;
+        dot += dax * dbx + day * dby;
+        cross += dax * dby - day * dbx;
+    }
+    cross.atan2(dot)
+}
+
+/// 按该对匹配点的主位移轴（|dx| vs |dy|）计算重叠比例。
+fn overlap_principal(
+    pair_points: &PairPoints,
+    a: usize,
+    b: usize,
+    ext_x: f32,
+    ext_y: f32,
+) -> Option<f32> {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let pts = pair_points.get(&(lo, hi))?;
+    if pts.len() < MIN_PAIR_MATCHES {
+        return None;
+    }
+    let mut sum_dx = 0.0f64;
+    let mut sum_dy = 0.0f64;
+    for &(xl, yl, xh, yh) in pts {
+        sum_dx += (xl - xh).abs() as f64;
+        sum_dy += (yl - yh).abs() as f64;
+    }
+    let axis_is_x = sum_dx >= sum_dy;
+    let extent = if axis_is_x { ext_x } else { ext_y };
+    overlap_fraction(pair_points, a, b, axis_is_x, extent)
+}
+
+/// 覆盖次数 → 热力色（冷色蓝→青→绿→黄绿，避免与红色描边冲突）。
+fn coverage_color(c: u32) -> Rgb<u8> {
+    match c {
+        0 => Rgb([10, 10, 16]),
+        1 => Rgb([40, 90, 170]),
+        2 => Rgb([60, 140, 230]),
+        3 => Rgb([70, 200, 190]),
+        4 => Rgb([110, 220, 120]),
+        _ => Rgb([200, 230, 90]),
+    }
+}
+
+fn set_px(canvas: &mut RgbImage, x: i32, y: i32, color: Rgb<u8>) {
+    let (w, h) = canvas.dimensions();
+    if x >= 0 && x < w as i32 && y >= 0 && y < h as i32 {
+        canvas.put_pixel(x as u32, y as u32, color);
+    }
+}
+
+/// 简单直线（DDA）。
+fn draw_line(canvas: &mut RgbImage, x0: f32, y0: f32, x1: f32, y1: f32, color: Rgb<u8>) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let steps = dx.abs().max(dy.abs()).ceil() as i32;
+    if steps == 0 {
+        set_px(canvas, x0.round() as i32, y0.round() as i32, color);
+        return;
+    }
+    for s in 0..=steps {
+        let t = s as f32 / steps as f32;
+        let px = (x0 + dx * t).round() as i32;
+        let py = (y0 + dy * t).round() as i32;
+        set_px(canvas, px, py, color);
+    }
+}
+
+/// 虚线（按像素距离做 dash/gap）。
+fn draw_dashed_line(
+    canvas: &mut RgbImage,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    color: Rgb<u8>,
+    dash: f32,
+    gap: f32,
+) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.5 {
+        return;
+    }
+    let steps = len.ceil() as i32;
+    let period = dash + gap;
+    for s in 0..=steps {
+        let t = s as f32 / steps as f32;
+        if (t * len) % period < dash {
+            let px = (x0 + dx * t).round() as i32;
+            let py = (y0 + dy * t).round() as i32;
+            set_px(canvas, px, py, color);
+        }
+    }
+}
+
+/// 实心圆点。
+fn draw_dot(canvas: &mut RgbImage, cx: f32, cy: f32, r: i32, color: Rgb<u8>) {
+    let cx = cx.round() as i32;
+    let cy = cy.round() as i32;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy <= r * r {
+                set_px(canvas, cx + dx, cy + dy, color);
+            }
+        }
+    }
+}
+
+/// 带厚度的直线（按垂直方向偏移采样）。
+fn draw_line_thick(
+    canvas: &mut RgbImage,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    color: Rgb<u8>,
+    thickness: f32,
+) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.5 {
+        let r = (thickness * 0.5).ceil() as i32;
+        draw_dot(canvas, x0, y0, r, color);
+        return;
+    }
+    let nx = -dy / len;
+    let ny = dx / len;
+    let half = thickness * 0.5;
+    let steps = len.ceil() as i32;
+    let offs = half.floor() as i32;
+    for s in 0..=steps {
+        let t = s as f32 / steps as f32;
+        let cx = x0 + dx * t;
+        let cy = y0 + dy * t;
+        for o in -offs..=offs {
+            let off = o as f32;
+            let px = (cx + nx * off).round() as i32;
+            let py = (cy + ny * off).round() as i32;
+            set_px(canvas, px, py, color);
+        }
+    }
+}
+
+/// 2.5D 视锥覆盖图：条带以网格、环绕以圆形（部分弧）布局合成相机视锥，
+/// 脚印朝向由相邻图相对旋转反推，地面足迹按覆盖次数栅格化着色，
+/// 等轴测投影统一绘制视锥、轨迹与覆盖。
 ///
 /// # Arguments
 ///
@@ -259,174 +494,348 @@ pub(crate) fn visualize_track_coverage_graph(
     paths: &[String],
     output_path: &str,
 ) {
-    println!("Generating track coverage graph...");
+    println!("Generating 2.5D frustum coverage map...");
     let start = Instant::now();
 
     let num_images = paths.len();
     let canvas_size: u32 = 2400;
     let margin: u32 = 200;
 
-    // 读取已注册相机的世界坐标中心（camera_poses.json），缺失或未注册为 None
-    let mut camera_centers: Vec<Option<Vector3<f64>>> = vec![None; num_images];
-    if let Ok(data) = fs::read_to_string("camera_poses.json") {
-        if let Ok(parsed) = serde_json::from_str::<CameraPosesFile>(&data) {
-            let mut by_name: HashMap<String, Vector3<f64>> = HashMap::new();
-            for entry in parsed.poses {
-                let r = Matrix3::new(
-                    entry.r[0][0],
-                    entry.r[0][1],
-                    entry.r[0][2],
-                    entry.r[1][0],
-                    entry.r[1][1],
-                    entry.r[1][2],
-                    entry.r[2][0],
-                    entry.r[2][1],
-                    entry.r[2][2],
-                );
-                let t = Vector3::new(entry.t[0], entry.t[1], entry.t[2]);
-                by_name.insert(entry.image, camera_center(&r, &t));
+    // 真实图像尺寸决定脚印宽高比；关键点在降采样帧，用其尺寸做重叠归一化
+    let (iw_img, ih_img) = image::open(&paths[0])
+        .map(|img| img.dimensions())
+        .unwrap_or((4000, 3000));
+    let (nw, nh) = feature_dimensions(iw_img, ih_img);
+    let aspect = iw_img as f32 / ih_img as f32;
+
+    // 条带结构（文件名序列）与匹配点坐标
+    let strips = infer_strips(paths);
+    let pair_points = collect_pair_points(tracks, features);
+
+    // 轨迹顺序（条带展平）
+    let traj: Vec<usize> = strips.iter().flatten().copied().collect();
+
+    // 相对旋转 + 累计转向（检测环绕）+ 累加朝向
+    let mut yaw_rel: Vec<f32> = Vec::with_capacity(traj.len().saturating_sub(1));
+    for w in traj.windows(2) {
+        yaw_rel.push(relative_yaw(&pair_points, w[0], w[1]));
+    }
+    let total_turn: f32 = yaw_rel.iter().map(|y| y.abs()).sum();
+    let orbital = total_turn > 90.0f32.to_radians();
+
+    let mut yaw = vec![0.0f32; num_images];
+    let mut acc = 0.0f32;
+    for (i, &idx) in traj.iter().enumerate() {
+        if i > 0 {
+            acc += yaw_rel[i - 1];
+        }
+        yaw[idx] = acc;
+    }
+
+    // 单位脚印尺寸：沿飞行轴为图像长边（真实宽高比）
+    let unit_h = 1.0f32;
+    let unit_w = aspect;
+    let hw = unit_w * 0.5;
+    let hh = unit_h * 0.5;
+
+    // 脚印中心（地面）与相机中心（单位空间）
+    let mut ground_center = vec![(0.0f32, 0.0f32); num_images];
+    let mut cam_center = vec![(0.0f32, 0.0f32); num_images];
+    let mut close_loop = false;
+    // 脚印「径向」半长：条带为图像高的一半，环绕为 r_g 的一半（使脚印延伸至圆心、覆盖中心）
+    let mut radial_half = hh;
+
+    if orbital {
+        // 环绕：θ_fov 由内参推（默认焦距），角度步由重叠反推，半径由数据推
+        let f_px = nw.max(nh) as f32;
+        let theta_fov = 2.0 * (nw as f32 / (2.0 * f_px)).atan();
+        let mut o_i = vec![0.3f32; traj.len().saturating_sub(1)];
+        for i in 0..o_i.len() {
+            if let Some(o) =
+                overlap_principal(&pair_points, traj[i], traj[i + 1], nw as f32, nh as f32)
+            {
+                o_i[i] = o.clamp(0.0, 1.0);
             }
-            for (i, path) in paths.iter().enumerate() {
-                if let Some(stem) = std::path::Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                {
-                    if let Some(c) = by_name.get(stem) {
-                        camera_centers[i] = Some(*c);
-                    }
+        }
+        let mut theta = vec![0.0f32; num_images];
+        let mut cum = 0.0f32;
+        for (i, &idx) in traj.iter().enumerate() {
+            theta[idx] = cum;
+            if i + 1 < traj.len() {
+                cum += (1.0 - o_i[i]) * theta_fov;
+            }
+        }
+        let span = cum;
+        close_loop = span >= 300.0f32.to_radians();
+        let r_g = unit_w / theta_fov;
+        let r_cam = r_g + 1.0;
+        radial_half = r_g * 0.5;
+        for &idx in &traj {
+            let (s, c) = theta[idx].sin_cos();
+            ground_center[idx] = (r_g * 0.5 * c, r_g * 0.5 * s);
+            cam_center[idx] = (r_cam * c, r_cam * s);
+        }
+    } else {
+        // 条带：网格布局，前向/侧向重叠反推
+        let horizontal = is_horizontal_flight(&pair_points);
+        let (fwd_extent, side_extent) = if horizontal {
+            (nw as f32, nh as f32)
+        } else {
+            (nh as f32, nw as f32)
+        };
+
+        let mut side_overlaps: Vec<f32> = Vec::new();
+        for r in 0..strips.len().saturating_sub(1) {
+            let k_max = strips[r].len().min(strips[r + 1].len());
+            for k in 0..k_max {
+                if let Some(o) = overlap_fraction(
+                    &pair_points,
+                    strips[r][k],
+                    strips[r + 1][k],
+                    !horizontal,
+                    side_extent,
+                ) {
+                    side_overlaps.push(o);
+                }
+            }
+        }
+        let side_overlap = median(&side_overlaps).unwrap_or(0.3).clamp(0.0, 1.0);
+
+        let mut y_cursor = 0.0f32;
+        for strip in &strips {
+            let mut x_cursor = 0.0f32;
+            for (ci, &idx) in strip.iter().enumerate() {
+                ground_center[idx] = (x_cursor + hw, y_cursor + hh);
+                if ci + 1 < strip.len() {
+                    let next = strip[ci + 1];
+                    let o = overlap_fraction(&pair_points, idx, next, horizontal, fwd_extent)
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0);
+                    let o = if o < MIN_OVERLAP { 0.0 } else { o };
+                    x_cursor += unit_w * (1.0 - o);
+                }
+            }
+            y_cursor += unit_h * (1.0 - side_overlap);
+        }
+        for &idx in &traj {
+            cam_center[idx] = ground_center[idx];
+        }
+    }
+
+    // 等轴测投影（单位空间）
+    let cos_a = ISO_ALPHA_DEG.to_radians().cos();
+    let sin_a = ISO_ALPHA_DEG.to_radians().sin();
+    let project =
+        |x: f32, y: f32, z: f32| -> (f32, f32) { ((x - y) * cos_a, (x + y) * sin_a - z * ISO_K) };
+
+    let z_mid = Z_CAM * MID_T;
+
+    struct Frustum {
+        depth: f32,
+        ground: [(f32, f32); 4],
+        mid: [(f32, f32); 4],
+    }
+
+    // 第一遍：按 yaw 旋转脚印、lerp 中间层，投影求包围盒
+    let mut min_px = f32::MAX;
+    let mut max_px = f32::MIN;
+    let mut min_py = f32::MAX;
+    let mut max_py = f32::MIN;
+
+    let corner_offsets = [
+        (-hw, -radial_half),
+        (hw, -radial_half),
+        (hw, radial_half),
+        (-hw, radial_half),
+    ];
+
+    let mut frustums: Vec<Frustum> = Vec::with_capacity(num_images);
+    for &idx in &traj {
+        let (gx, gy) = ground_center[idx];
+        let (cx3, cy3) = cam_center[idx];
+        let (sy, cy) = yaw[idx].sin_cos();
+        // 中间层中心 = lerp(地面中心, 相机中心, MID_T)
+        let mx3 = gx + (cx3 - gx) * MID_T;
+        let my3 = gy + (cy3 - gy) * MID_T;
+
+        let mut g = [(0.0f32, 0.0f32); 4];
+        let mut m = [(0.0f32, 0.0f32); 4];
+        for k in 0..4 {
+            let (ox, oy) = corner_offsets[k];
+            let rx = ox * cy - oy * sy;
+            let ry = ox * sy + oy * cy;
+            let gx3 = gx + rx;
+            let gy3 = gy + ry;
+            let mxk = mx3 + (gx3 - gx) * MID_S;
+            let myk = my3 + (gy3 - gy) * MID_S;
+            let gp = project(gx3, gy3, 0.0);
+            let mp = project(mxk, myk, z_mid);
+            g[k] = gp;
+            m[k] = mp;
+            min_px = min_px.min(gp.0).min(mp.0);
+            max_px = max_px.max(gp.0).max(mp.0);
+            min_py = min_py.min(gp.1).min(mp.1);
+            max_py = max_py.max(gp.1).max(mp.1);
+        }
+        frustums.push(Frustum {
+            depth: gx + gy,
+            ground: g,
+            mid: m,
+        });
+    }
+
+    let span_x = (max_px - min_px).max(1e-6);
+    let span_y = (max_py - min_py).max(1e-6);
+    let usable = (canvas_size - 2 * margin) as f32;
+    let scale = (usable / span_x).min(usable / span_y);
+    let offset_x = (canvas_size as f32 - span_x * scale) * 0.5;
+    let offset_y = (canvas_size as f32 - span_y * scale) * 0.5;
+    let to_canvas = |p: (f32, f32)| -> (f32, f32) {
+        (
+            offset_x + (p.0 - min_px) * scale,
+            offset_y + (p.1 - min_py) * scale,
+        )
+    };
+
+    // 第二遍：转换到画布坐标
+    let cams: Vec<Frustum> = frustums
+        .into_iter()
+        .map(|f| Frustum {
+            depth: f.depth,
+            ground: [
+                to_canvas(f.ground[0]),
+                to_canvas(f.ground[1]),
+                to_canvas(f.ground[2]),
+                to_canvas(f.ground[3]),
+            ],
+            mid: [
+                to_canvas(f.mid[0]),
+                to_canvas(f.mid[1]),
+                to_canvas(f.mid[2]),
+                to_canvas(f.mid[3]),
+            ],
+        })
+        .collect();
+
+    // 中间层中心点（按图像索引，供轨迹使用）
+    let mid_centers: Vec<(f32, f32)> = cams
+        .iter()
+        .map(|f| {
+            (
+                (f.mid[0].0 + f.mid[2].0) * 0.5,
+                (f.mid[0].1 + f.mid[2].1) * 0.5,
+            )
+        })
+        .collect();
+
+    // 覆盖次数栅格化：把每个地面足迹（投影后平行四边形）累加计数
+    let mut count = vec![0u32; (canvas_size as usize) * (canvas_size as usize)];
+    for f in &cams {
+        let p0 = f.ground[0];
+        let e1 = (f.ground[1].0 - p0.0, f.ground[1].1 - p0.1);
+        let e2 = (f.ground[3].0 - p0.0, f.ground[3].1 - p0.1);
+        let cross = e1.0 * e2.1 - e1.1 * e2.0;
+        if cross.abs() < 1e-6 {
+            continue;
+        }
+        let minx = f
+            .ground
+            .iter()
+            .map(|p| p.0)
+            .fold(f32::MAX, f32::min)
+            .floor() as i32;
+        let maxx = f.ground.iter().map(|p| p.0).fold(f32::MIN, f32::max).ceil() as i32;
+        let miny = f
+            .ground
+            .iter()
+            .map(|p| p.1)
+            .fold(f32::MAX, f32::min)
+            .floor() as i32;
+        let maxy = f.ground.iter().map(|p| p.1).fold(f32::MIN, f32::max).ceil() as i32;
+        for py in miny.max(0)..=maxy.min(canvas_size as i32 - 1) {
+            for px in minx.max(0)..=maxx.min(canvas_size as i32 - 1) {
+                let dx = px as f32 - p0.0;
+                let dy = py as f32 - p0.1;
+                let u = (dx * e2.1 - dy * e2.0) / cross;
+                let v = (e1.0 * dy - e1.1 * dx) / cross;
+                if u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0 {
+                    count[py as usize * canvas_size as usize + px as usize] += 1;
                 }
             }
         }
     }
 
-    let positioned: Vec<usize> = camera_centers
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| c.map(|_| i))
-        .collect();
-
-    // 有相机位置 -> 俯视图 XY 投影；否则按文件名序列号蛇形布局
-    let positions: Vec<Option<(f32, f32)>> = if positioned.len() >= 2 {
-        let pts: Vec<(f64, f64)> = positioned
-            .iter()
-            .map(|&i| {
-                let c = camera_centers[i].unwrap();
-                (c.x, c.y)
-            })
-            .collect();
-        let min_x = pts.iter().map(|p| p.0).fold(f64::MAX, f64::min);
-        let max_x = pts.iter().map(|p| p.0).fold(f64::MIN, f64::max);
-        let min_y = pts.iter().map(|p| p.1).fold(f64::MAX, f64::min);
-        let max_y = pts.iter().map(|p| p.1).fold(f64::MIN, f64::max);
-        let span_x = (max_x - min_x).max(1e-6);
-        let span_y = (max_y - min_y).max(1e-6);
-        let usable = (canvas_size - 2 * margin) as f64;
-        let scale = usable / span_x.max(span_y);
-        let center_x = (min_x + max_x) / 2.0;
-        let center_y = (min_y + max_y) / 2.0;
-
-        let mut pos = vec![None; num_images];
-        for &i in &positioned {
-            let c = camera_centers[i].unwrap();
-            let px = (canvas_size as f64 / 2.0 + (c.x - center_x) * scale) as f32;
-            let py = (canvas_size as f64 / 2.0 - (c.y - center_y) * scale) as f32;
-            pos[i] = Some((px, py));
-        }
-        pos
-    } else {
-        compute_snake_positions(paths, canvas_size, margin)
-            .into_iter()
-            .map(Some)
-            .collect()
-    };
-
-    let layout_mode = if positioned.len() >= 2 {
-        "top-down camera path (XY)"
-    } else {
-        "snake strip (filename sequence)"
-    };
-
-    let line_thickness = 1.5f32;
-
-    let mut pair_counts = vec![vec![0usize; num_images]; num_images];
-
-    for track in tracks {
-        for w in track.observations.windows(2) {
-            let (a, _) = w[0];
-            let (b, _) = w[1];
-            pair_counts[a][b] += 1;
-            pair_counts[b][a] += 1;
+    // 地面层：按覆盖次数着色
+    let mut canvas = RgbImage::new(canvas_size, canvas_size);
+    for py in 0..canvas_size {
+        for px in 0..canvas_size {
+            let c = count[py as usize * canvas_size as usize + px as usize];
+            canvas.put_pixel(px, py, coverage_color(c));
         }
     }
 
-    let mut canvas = RgbImage::from_pixel(canvas_size, canvas_size, Rgb([10, 10, 16]));
-    let max_count = pair_counts
-        .iter()
-        .flat_map(|row| row.iter())
-        .copied()
-        .max()
-        .unwrap_or(1)
-        .max(1) as f32;
+    // 深度排序（远→近）
+    let mut order: Vec<usize> = (0..cams.len()).collect();
+    order.sort_by(|&a, &b| {
+        cams[a]
+            .depth
+            .partial_cmp(&cams[b].depth)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    for i in 0..num_images {
-        for j in (i + 1)..num_images {
-            let count = pair_counts[i][j];
-            if count == 0 {
-                continue;
-            }
-            let intensity = count as f32 / max_count;
-            let color = heat_color(intensity * 0.8);
+    let mid_color = Rgb([255, 60, 60]);
+    let edge_color = Rgb([130, 200, 255]);
 
-            let (p1, p2) = match (positions[i], positions[j]) {
-                (Some(a), Some(b)) => (a, b),
-                _ => continue,
-            };
-            let thick = (1.0 + intensity * 5.0 * line_thickness) as f32;
-            draw_thick_line(&mut canvas, p1, p2, color, thick);
+    // 依次绘制每个视锥：中间层矩形（红色加宽描边）+ 中间层→地面虚线
+    for &i in &order {
+        let f = &cams[i];
+        for k in 0..4 {
+            let a = f.mid[k];
+            let b = f.mid[(k + 1) % 4];
+            draw_line_thick(&mut canvas, a.0, a.1, b.0, b.1, mid_color, 2.0);
+        }
+        for k in 0..4 {
+            draw_dashed_line(
+                &mut canvas,
+                f.mid[k].0,
+                f.mid[k].1,
+                f.ground[k].0,
+                f.ground[k].1,
+                edge_color,
+                4.0,
+                3.0,
+            );
         }
     }
 
-    for (i, pos) in positions.iter().enumerate() {
-        let (x, y) = match pos {
-            Some(p) => *p,
-            None => continue,
-        };
-        let ix = x.round() as i32;
-        let iy = y.round() as i32;
-
-        let total_kp = features[i].keypoints.len();
-        let node_r = (10.0 + (total_kp as f32 / 5000.0) * 16.0) as i32;
-
-        drawing::draw_filled_circle_mut(&mut canvas, (ix, iy), node_r, Rgb([40, 80, 180]));
-
-        drawing::draw_filled_circle_mut(
-            &mut canvas,
-            (ix, iy),
-            node_r.max(2) - 2,
-            Rgb([60, 140, 240]),
-        );
-
-        let lx = ix + node_r + 6;
-        let ly = iy - node_r - 6;
-
-        let name = std::path::Path::new(&paths[i])
-            .file_stem()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?")
-            .replace("IMG_", "");
-
-        draw_text_simple(&mut canvas, lx, ly, &name, Rgb([200, 210, 240]));
+    // 飞行轨迹：按轨迹顺序连接中间层中心点；环绕时闭环
+    let traj_color = Rgb([255, 210, 80]);
+    for w in traj.windows(2) {
+        let a = mid_centers[w[0]];
+        let b = mid_centers[w[1]];
+        draw_line(&mut canvas, a.0, a.1, b.0, b.1, traj_color);
+    }
+    if close_loop && traj.len() > 2 {
+        let a = mid_centers[traj[traj.len() - 1]];
+        let b = mid_centers[traj[0]];
+        draw_line(&mut canvas, a.0, a.1, b.0, b.1, traj_color);
     }
 
+    // 中间层矩形中心点（红色圆点）
+    let center_dot_color = Rgb([255, 40, 40]);
+    for &p in &mid_centers {
+        draw_dot(&mut canvas, p.0, p.1, 4, center_dot_color);
+    }
+
+    // 图例
     {
-        // Legend
         let lx = 40;
-        let mut ly = canvas_size as i32 - 200;
+        let mut ly = canvas_size as i32 - 280;
         draw_text_simple(
             &mut canvas,
             lx,
             ly,
-            "TRACK COVERAGE GRAPH",
+            "2.5D FRUSTUM COVERAGE",
             Rgb([180, 190, 220]),
         );
         ly += 24;
@@ -435,10 +844,10 @@ pub(crate) fn visualize_track_coverage_graph(
             lx,
             ly,
             &format!(
-                "{} images  ·  {} tracks  ·  window={}",
+                "{} images - {} tracks - mode {}",
                 num_images,
                 tracks.len(),
-                SLIDING_WINDOW,
+                if orbital { "orbital" } else { "strip" }
             ),
             Rgb([120, 130, 160]),
         );
@@ -447,29 +856,7 @@ pub(crate) fn visualize_track_coverage_graph(
             &mut canvas,
             lx,
             ly,
-            &format!(
-                "Layout: {}  ·  positioned: {}/{}",
-                layout_mode,
-                positioned.len(),
-                num_images
-            ),
-            Rgb([120, 130, 160]),
-        );
-        ly += 28;
-
-        for (t, label) in [(0.05, "few"), (0.4, "medium"), (0.85, "many")] {
-            let color = heat_color(t);
-            drawing::draw_filled_circle_mut(&mut canvas, (lx + 6, ly + 3), 5, color);
-            draw_text_simple(&mut canvas, lx + 20, ly, label, Rgb([160, 170, 200]));
-            ly += 18;
-        }
-
-        ly += 8;
-        draw_text_simple(
-            &mut canvas,
-            lx,
-            ly,
-            "Line color = shared track count  ·  Node size = keypoint count",
+            "Ground color = overlap count",
             Rgb([100, 110, 140]),
         );
         ly += 20;
@@ -477,68 +864,58 @@ pub(crate) fn visualize_track_coverage_graph(
             &mut canvas,
             lx,
             ly,
-            &format!(
-                "Max shared tracks on one edge: {}  ·  Parameters: ratio={} kp_max={}",
-                max_count as usize, RATIO_THRESHOLD, MAX_KEYPOINTS_PER_IMAGE
-            ),
+            "Red outline = mid layer",
             Rgb([100, 110, 140]),
         );
+        ly += 20;
+        draw_text_simple(
+            &mut canvas,
+            lx,
+            ly,
+            "Red dot = mid layer center",
+            Rgb([100, 110, 140]),
+        );
+        ly += 20;
+        draw_text_simple(
+            &mut canvas,
+            lx,
+            ly,
+            "Yellow line = flight trajectory (mid layer)",
+            Rgb([100, 110, 140]),
+        );
+        ly += 26;
+        let mut sx = lx;
+        for (c, label) in [(1u32, "1"), (2, "2"), (3, "3"), (4, "4")] {
+            draw_dot(
+                &mut canvas,
+                sx as f32 + 5.0,
+                ly as f32 + 3.0,
+                4,
+                coverage_color(c),
+            );
+            draw_text_simple(&mut canvas, sx + 14, ly, label, Rgb([150, 160, 190]));
+            sx += 34;
+        }
     }
 
+    if let Some(parent) = std::path::Path::new(output_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).expect("Failed to create coverage output directory");
+        }
+    }
     canvas
         .save(output_path)
         .expect("Failed to save coverage graph");
 
     let elapsed = start.elapsed();
     println!(
-        "Coverage graph saved to {} ({:.1} KB) in {:.2}s\n",
+        "Coverage map saved to {} ({:.1} KB) in {:.2}s\n",
         output_path,
         fs::metadata(output_path)
             .map(|m| m.len() as f64 / 1024.0)
             .unwrap_or(0.0),
         elapsed.as_secs_f32(),
     );
-}
-
-fn draw_thick_line(
-    canvas: &mut RgbImage,
-    p1: (f32, f32),
-    p2: (f32, f32),
-    color: Rgb<u8>,
-    thickness: f32,
-) {
-    let dx = p2.0 - p1.0;
-    // 带厚度的反锯齿直线
-    let dy = p2.1 - p1.1;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len < 0.5 {
-        return;
-    }
-    let nx = -dy / len * thickness * 0.5;
-    let ny = dx / len * thickness * 0.5;
-
-    let (w, h) = canvas.dimensions();
-    let (_wf, _hf) = (w as f32, h as f32);
-
-    let steps = len.ceil() as i32;
-    for s in 0..=steps {
-        let t = s as f32 / steps as f32;
-        let cx = p1.0 + dx * t;
-        let cy = p1.1 + dy * t;
-
-        for o in -1i32..=1 {
-            let off = o as f32;
-            let px = (cx + nx * off) as i32;
-            let py = (cy + ny * off) as i32;
-            if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
-                let pixel = canvas.get_pixel_mut(px as u32, py as u32);
-                let blend = 0.4f32;
-                pixel[0] = (pixel[0] as f32 * (1.0 - blend) + color[0] as f32 * blend) as u8;
-                pixel[1] = (pixel[1] as f32 * (1.0 - blend) + color[1] as f32 * blend) as u8;
-                pixel[2] = (pixel[2] as f32 * (1.0 - blend) + color[2] as f32 * blend) as u8;
-            }
-        }
-    }
 }
 
 fn draw_text_simple(canvas: &mut RgbImage, x: i32, y: i32, text: &str, color: Rgb<u8>) {

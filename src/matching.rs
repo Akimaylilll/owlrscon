@@ -2,16 +2,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
-use fast_hnsw::{Builder, Hnsw};
+use cubecl::prelude::*;
 use image::GenericImageView;
 use nalgebra::{Matrix3, Vector3};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use sift_rs::{KeyPoint, Normalization, SiftDescriptor, SiftDetector, SiftParams};
+use sift_cubecl::{KeyPoint, Sift, SiftParams};
 
-use crate::imgproc::feature_dimensions;
+use crate::imgproc::{feature_dimensions, MAX_IMAGE_DIMENSION};
 use crate::sfm::{ransac_fundamental, RANSAC_ITERATIONS, RANSAC_THRESHOLD_PX};
-use crate::types::{ImageFeatures, DISTANCE_THRESHOLD, GUIDED_EPIPOLAR_THRESHOLD_PX, RANSAC_SEED};
+use crate::types::{ImageFeatures, DISTANCE_THRESHOLD, GUIDED_EPIPOLAR_THRESHOLD_PX};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedKeyPoint {
@@ -21,11 +21,12 @@ struct CachedKeyPoint {
     octave: usize,
     first_octave: i32,
     orientation: f32,
+    scale_idx: usize,
     descriptor: Vec<f32>,
 }
 
-impl From<&KeyPoint> for CachedKeyPoint {
-    fn from(kp: &KeyPoint) -> Self {
+impl CachedKeyPoint {
+    fn from_parts(kp: &KeyPoint, descriptor: Vec<f32>) -> Self {
         CachedKeyPoint {
             x: kp.x,
             y: kp.y,
@@ -33,22 +34,22 @@ impl From<&KeyPoint> for CachedKeyPoint {
             octave: kp.octave,
             first_octave: kp.first_octave,
             orientation: kp.orientation,
-            descriptor: kp.descriptor.clone(),
+            scale_idx: kp.scale_idx,
+            descriptor,
         }
     }
-}
 
-impl From<CachedKeyPoint> for KeyPoint {
-    fn from(ckp: CachedKeyPoint) -> Self {
-        KeyPoint {
-            x: ckp.x,
-            y: ckp.y,
-            scale: ckp.scale,
-            octave: ckp.octave,
-            first_octave: ckp.first_octave,
-            orientation: ckp.orientation,
-            descriptor: ckp.descriptor,
-        }
+    fn into_parts(self) -> (KeyPoint, Vec<f32>) {
+        let kp = KeyPoint {
+            x: self.x,
+            y: self.y,
+            scale: self.scale,
+            octave: self.octave,
+            first_octave: self.first_octave,
+            orientation: self.orientation,
+            scale_idx: self.scale_idx,
+        };
+        (kp, self.descriptor)
     }
 }
 
@@ -62,16 +63,29 @@ impl From<&ImageFeatures> for CachedImageFeatures {
     fn from(f: &ImageFeatures) -> Self {
         CachedImageFeatures {
             path: f.path.clone(),
-            keypoints: f.keypoints.iter().map(CachedKeyPoint::from).collect(),
+            keypoints: f
+                .keypoints
+                .iter()
+                .zip(f.descriptors.iter())
+                .map(|(kp, d)| CachedKeyPoint::from_parts(kp, d.clone()))
+                .collect(),
         }
     }
 }
 
 impl From<CachedImageFeatures> for ImageFeatures {
     fn from(cf: CachedImageFeatures) -> Self {
+        let mut keypoints = Vec::with_capacity(cf.keypoints.len());
+        let mut descriptors = Vec::with_capacity(cf.keypoints.len());
+        for ckp in cf.keypoints {
+            let (kp, d) = ckp.into_parts();
+            keypoints.push(kp);
+            descriptors.push(d);
+        }
         ImageFeatures {
             path: cf.path,
-            keypoints: cf.keypoints.into_iter().map(KeyPoint::from).collect(),
+            keypoints,
+            descriptors,
         }
     }
 }
@@ -93,7 +107,7 @@ impl From<CachedImageFeatures> for ImageFeatures {
 /// let features = extract_features(&paths, 0);
 /// ```
 pub(crate) fn extract_features(paths: &[String], first_octave: i32) -> Vec<ImageFeatures> {
-    let cache_dir = "features_cache";
+    let cache_dir = crate::types::FEATURES_CACHE_DIR;
     fs::create_dir_all(cache_dir).expect("Failed to create features_cache directory");
 
     println!(
@@ -105,64 +119,68 @@ pub(crate) fn extract_features(paths: &[String], first_octave: i32) -> Vec<Image
     let atomic_cached = std::sync::atomic::AtomicU32::new(0);
     let atomic_computed = std::sync::atomic::AtomicU32::new(0);
 
-    let mut results: Vec<ImageFeatures> = paths
-        .par_iter()
-        .map(|path| {
-            let stem = std::path::Path::new(path)
-                .file_stem()
-                .unwrap()
-                .to_str()
-                .unwrap();
-            let cache_path = format!("{}/{}.json", cache_dir, stem);
+    let sift = Sift::default();
 
-            if let Ok(data) = fs::read_to_string(&cache_path) {
-                if let Ok(cached) = serde_json::from_str::<CachedImageFeatures>(&data) {
-                    if cached.path == *path {
-                        atomic_cached.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return ImageFeatures::from(cached);
+    // 有限并发：SIFT 每图像在 GPU 上驻留高斯金字塔+梯度+DoG（约 96 字节/像素），
+    // 按显存预算自动计算线程数，避免多图像并发提取导致 OOM
+    let per_image_bytes = (MAX_IMAGE_DIMENSION as usize).pow(2) * 96;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(crate::backend::parallelism(per_image_bytes))
+        .build()
+        .expect("build sift thread pool");
+
+    let mut results: Vec<ImageFeatures> = pool.install(|| {
+        paths
+            .par_iter()
+            .map(|path| {
+                let stem = std::path::Path::new(path)
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                let cache_path = format!("{}/{}.json", cache_dir, stem);
+
+                if let Ok(data) = fs::read_to_string(&cache_path) {
+                    if let Ok(cached) = serde_json::from_str::<CachedImageFeatures>(&data) {
+                        if cached.path == *path {
+                            atomic_cached.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return ImageFeatures::from(cached);
+                        }
                     }
                 }
-            }
 
-            let img = image::open(path).unwrap_or_else(|_| panic!("Failed to open {}", path));
-            let mut gray = img.grayscale();
-            let (w, h) = gray.dimensions();
-            let (nw, nh) = feature_dimensions(w, h);
-            if nw != w || nh != h {
-                gray = gray.resize(nw, nh, image::imageops::FilterType::Triangle);
-            }
-            let mut detector = SiftDetector::new();
-            let mut params = SiftParams {
-                max_num_features: 8192,
-                first_octave,
-                num_octaves: 4,
-                edge_threshold: 10.0,
-                ..SiftParams::default()
-            };
-            params.peak_threshold = 0.02 / params.octave_resolution as f32;
-            let mut keypoints = detector.detect(gray, &params);
-            let descriptor = SiftDescriptor::new();
-            descriptor.compute_descriptors(
-                &mut keypoints,
-                detector.scale_spaces,
-                Normalization::L1,
-            );
+                let img = image::open(path).unwrap_or_else(|_| panic!("Failed to open {}", path));
+                let mut gray = img.grayscale();
+                let (w, h) = gray.dimensions();
+                let (nw, nh) = feature_dimensions(w, h);
+                if nw != w || nh != h {
+                    gray = gray.resize(nw, nh, image::imageops::FilterType::Triangle);
+                }
+                let mut params = SiftParams {
+                    max_num_features: 8192,
+                    first_octave,
+                    num_octaves: 4,
+                    edge_threshold: 10.0,
+                    ..SiftParams::default()
+                };
+                params.peak_threshold = 0.02 / params.octave_resolution as f32;
+                let (keypoints, descriptors) = sift.detect_and_compute(gray, &params);
 
-            let kps = keypoints;
+                let result = ImageFeatures {
+                    path: path.clone(),
+                    keypoints,
+                    descriptors,
+                };
 
-            let result = ImageFeatures {
-                path: path.clone(),
-                keypoints: kps,
-            };
+                let cached: CachedImageFeatures = (&result).into();
+                let json = serde_json::to_string(&cached).expect("Failed to serialize features");
+                fs::write(&cache_path, json).expect("Failed to write cache file");
 
-            let cached: CachedImageFeatures = (&result).into();
-            let json = serde_json::to_string(&cached).expect("Failed to serialize features");
-            fs::write(&cache_path, json).expect("Failed to write cache file");
-
-            atomic_computed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            result
-        })
-        .collect();
+                atomic_computed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                result
+            })
+            .collect()
+    });
 
     let cached_count = atomic_cached.load(std::sync::atomic::Ordering::Relaxed);
     let computed_count = atomic_computed.load(std::sync::atomic::Ordering::Relaxed);
@@ -235,126 +253,138 @@ fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     sum.sqrt()
 }
 
-/// SIMD 友好的欧氏距离度量（零大小标记类型）。
+/// 将一图关键点的 128 维描述子展平为连续 `Vec<f32>`，供 cubecl 核使用。
 ///
-/// 通过 `fast_hnsw::distance::Distance` 特征接入 HNSW 索引，
-/// 其 [`distance`](SimdEuclidean::distance) 实现采用 4 路展开
-/// 累加，配合 `target-cpu=native` 时可被编译器自动向量化。
-struct SimdEuclidean;
+/// 所有描述子必须长度一致；返回 (展平向量, 维度, 描述子个数)。
+fn flatten_descriptors(descriptors: &[Vec<f32>]) -> (Vec<f32>, usize, usize) {
+    let dim = descriptors.first().map(|d| d.len()).unwrap_or(0);
+    let mut flat = Vec::with_capacity(descriptors.len() * dim);
+    for d in descriptors {
+        flat.extend_from_slice(d);
+    }
+    (flat, dim, descriptors.len())
+}
 
-impl fast_hnsw::distance::Distance for SimdEuclidean {
-    /// 计算两个浮点切片之间的欧氏距离。
-    ///
-    /// 将累加过程拆分为 4 路独立求和以打破串行依赖，
-    /// 相比朴素循环具有更好的指令级并行与向量化潜力。
-    ///
-    /// # Arguments
-    ///
-    /// * `a` - 第一个向量切片
-    /// * `b` - 第二个向量切片
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// let metric = SimdEuclidean;
-    /// let a = [0.0f32; 128];
-    /// let b = [1.0f32; 128];
-    /// let d = metric.distance(&a, &b);
-    /// assert!(d > 0.0);
-    /// ```
-    #[inline]
-    fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        let n = a.len();
-        let mut s0 = 0.0f32;
-        let mut s1 = 0.0f32;
-        let mut s2 = 0.0f32;
-        let mut s3 = 0.0f32;
-        let mut i = 0;
-        while i + 4 <= n {
-            let d0 = a[i] - b[i];
-            let d1 = a[i + 1] - b[i + 1];
-            let d2 = a[i + 2] - b[i + 2];
-            let d3 = a[i + 3] - b[i + 3];
-            s0 += d0 * d0;
-            s1 += d1 * d1;
-            s2 += d2 * d2;
-            s3 += d3 * d3;
-            i += 4;
+/// 2-NN 内核的工作组线程数。原为 1（每工作组单线程），导致 warp 利用率与
+/// 显存合并访存几乎失效，是 8 小时级匹配耗时的主因。256 线程下，同一 warp 内
+/// 线程在同一 (j,k) 步读取相同的 db 元素（广播）与连续的 queries 元素（合并），
+/// 访存效率提升数十倍。
+const NN2_THREADS: u32 = 256;
+
+/// 暴力 2-NN 描述子匹配（cubecl 内核）。
+///
+/// 每个计算单元负责一个查询描述子，扫描整个数据库并保留最近/次近两个
+/// 平方 L2 距离及最近邻索引。
+#[cube(launch_unchecked)]
+fn nn2_match_kernel<F: Float>(
+    queries: &Array<F>,
+    db: &Array<F>,
+    dim: u32,
+    num_db: u32,
+    best_id: &mut Array<u32>,
+    best_dist: &mut Array<F>,
+    second_dist: &mut Array<F>,
+) {
+    let q = ABSOLUTE_POS;
+    let dim_us = usize::cast_from(dim);
+    if q < queries.len() / dim_us {
+        let mut bd = F::new(f32::MAX);
+        let mut sd = F::new(f32::MAX);
+        let mut bid = 0u32;
+
+        for j in 0..num_db {
+            let mut acc = F::new(0.0f32);
+            let j_us = usize::cast_from(j);
+            for k in 0..dim {
+                let k_us = usize::cast_from(k);
+                let d = queries[q * dim_us + k_us] - db[j_us * dim_us + k_us];
+                acc += d * d;
+            }
+            if acc < bd {
+                sd = bd;
+                bd = acc;
+                bid = j;
+            } else if acc < sd {
+                sd = acc;
+            }
         }
-        while i < n {
-            let d = a[i] - b[i];
-            s0 += d * d;
-            i += 1;
-        }
-        (s0 + s1 + s2 + s3).sqrt()
+
+        best_id[q] = bid;
+        best_dist[q] = bd.sqrt();
+        second_dist[q] = sd.sqrt();
     }
 }
 
-/// 为一组关键点的描述子构建 HNSW 近似最近邻索引。
-///
-/// 基于 `fast_hnsw` 构建索引，等价于 FLANN 的近似最近邻搜索，
-/// 供后续 2-NN 匹配时快速查询每个描述子的近邻。每个关键点的
-/// `descriptor` 字段被作为索引向量插入。
-///
-/// # Arguments
-///
-/// * `kp` - 关键点切片，取其描述子作为索引向量
-///
-/// # Examples
-///
-/// ```rust,ignore
-/// let kp: Vec<KeyPoint> = detect_features(&image);
-/// let index = build_hnsw_index(&kp);
-/// ```
-fn build_hnsw_index(kp: &[KeyPoint]) -> Hnsw<SimdEuclidean> {
-    let mut index: Hnsw<SimdEuclidean> = Builder::new()
-        .m(16)
-        .ef_construction(200)
-        .capacity(kp.len())
-        .seed(RANSAC_SEED)
-        .build(SimdEuclidean);
-    for k in kp {
-        index.insert(k.descriptor.clone());
+/// 计算每个查询描述子到数据库描述子的最近/次近欧氏距离及最近邻索引。
+fn nn2_match(query: &[f32], db: &[f32], dim: usize, num_db: usize) -> Vec<(usize, f32, f32)> {
+    let client = crate::backend::client();
+    let num_query = query.len() / dim;
+
+    let q_handle = client.create_from_slice(f32::as_bytes(query));
+    let d_handle = client.create_from_slice(f32::as_bytes(db));
+    let bi_handle = client.empty(num_query * core::mem::size_of::<u32>());
+    let bd_handle = client.empty(num_query * core::mem::size_of::<f32>());
+    let sd_handle = client.empty(num_query * core::mem::size_of::<f32>());
+
+    unsafe {
+        nn2_match_kernel::launch_unchecked::<f32, crate::backend::BackendRuntime>(
+            client,
+            CubeCount::Static(num_query.div_ceil(NN2_THREADS as usize) as u32, 1, 1),
+            CubeDim::new_1d(NN2_THREADS),
+            ArrayArg::from_raw_parts(q_handle.clone(), query.len()),
+            ArrayArg::from_raw_parts(d_handle.clone(), db.len()),
+            dim as u32,
+            num_db as u32,
+            ArrayArg::from_raw_parts(bi_handle.clone(), num_query),
+            ArrayArg::from_raw_parts(bd_handle.clone(), num_query),
+            ArrayArg::from_raw_parts(sd_handle.clone(), num_query),
+        );
     }
-    index
+
+    let bi_bytes = client.read_one(bi_handle).expect("read best_id");
+    let bd_bytes = client.read_one(bd_handle).expect("read best_dist");
+    let sd_bytes = client.read_one(sd_handle).expect("read second_dist");
+
+    let bi: &[u32] = u32::from_bytes(&bi_bytes);
+    let bd: &[f32] = f32::from_bytes(&bd_bytes);
+    let sd: &[f32] = f32::from_bytes(&sd_bytes);
+
+    (0..num_query)
+        .map(|i| (bi[i] as usize, bd[i], sd[i]))
+        .collect()
 }
 
-/// 对 HNSW 索引执行 kNN=2 查询，按 Lowe 比率检验 + 绝对距离阈值筛选匹配。
+/// 对查询描述子执行 cubecl 暴力 2-NN 匹配，按 Lowe 比率检验 + 绝对距离阈值筛选。
 ///
-/// 对每个查询关键点取最近与次近两个邻居，仅当最近距离满足
+/// 对每个查询描述子取最近与次近两个邻居，仅当最近距离满足
 /// `best < distance_threshold` 且 `best < ratio_threshold * second`
 /// 时保留该匹配。
 ///
 /// # Arguments
 ///
-/// * `index` - 目标图像的 HNSW 索引
-/// * `kp_a` - 查询侧关键点
+/// * `query_desc` - 查询侧展平描述子（`num_query * dim`）
+/// * `db_desc` - 目标侧展平描述子（`num_db * dim`）
+/// * `dim` - 描述子维度
+/// * `num_db` - 目标侧描述子个数
 /// * `ratio_threshold` - Lowe 比率阈值
 /// * `distance_threshold` - 描述子绝对距离阈值
-///
-/// # Examples
-///
-/// ```rust,ignore
-/// let index = build_hnsw_index(&kp_b);
-/// let matches = query_2nn(&index, &kp_a, 0.8, 0.7);
-/// ```
 fn query_2nn(
-    index: &Hnsw<SimdEuclidean>,
-    kp_a: &[KeyPoint],
+    query_desc: &[f32],
+    db_desc: &[f32],
+    dim: usize,
+    num_db: usize,
     ratio_threshold: f32,
     distance_threshold: f32,
 ) -> Vec<(usize, usize)> {
-    kp_a.par_iter()
+    if query_desc.is_empty() || db_desc.is_empty() || num_db < 2 {
+        return Vec::new();
+    }
+    nn2_match(query_desc, db_desc, dim, num_db)
+        .into_iter()
         .enumerate()
-        .filter_map(|(i, k1)| {
-            let results = index.search(&k1.descriptor, 2, 32);
-            if results.len() < 2 {
-                return None;
-            }
-            let best = results[0].distance;
-            let second = results[1].distance;
+        .filter_map(|(i, (id, best, second))| {
             if best < distance_threshold && best < ratio_threshold * second {
-                Some((i, results[0].id))
+                Some((i, id))
             } else {
                 None
             }
@@ -388,6 +418,8 @@ fn guided_matching(
     f: &Matrix3<f64>,
     kp_a: &[KeyPoint],
     kp_b: &[KeyPoint],
+    desc_a: &[Vec<f32>],
+    desc_b: &[Vec<f32>],
     used_a: &std::collections::HashSet<usize>,
     used_b: &std::collections::HashSet<usize>,
     epi_threshold_px: f64,
@@ -446,7 +478,7 @@ fn guided_matching(
                 let k2 = &kp_b[j];
                 let d = (lx * k2.x as f64 + ly * k2.y as f64 + lz).abs() / denom;
                 if d <= epi_threshold_px {
-                    let dist = euclidean_distance(&k1.descriptor, &k2.descriptor);
+                    let dist = euclidean_distance(&desc_a[i], &desc_b[j]);
                     if dist < desc_threshold {
                         match *best {
                             None => *best = Some((dist, j)),
@@ -553,7 +585,7 @@ pub(crate) fn match_all_pairs(features: &[ImageFeatures], ratio_threshold: f32) 
         .flat_map(|i| ((i + 1)..num_images).map(move |j| (i, j)))
         .collect();
 
-    let cache_dir = "matches_cache";
+    let cache_dir = crate::types::MATCHES_CACHE_DIR;
     fs::create_dir_all(cache_dir).expect("Failed to create matches_cache directory");
 
     println!(
@@ -564,10 +596,10 @@ pub(crate) fn match_all_pairs(features: &[ImageFeatures], ratio_threshold: f32) 
     let ransac_total = std::sync::atomic::AtomicU32::new(0);
     let cache_hit = std::sync::atomic::AtomicU32::new(0);
 
-    // 每张图像只构建一次 HNSW 索引，跨所有图像对复用
-    let indices: Vec<Hnsw<SimdEuclidean>> = features
+    // 每张图像只展平一次描述子，跨所有图像对复用（cubecl 核按需上传）
+    let flat: Vec<(Vec<f32>, usize, usize)> = features
         .par_iter()
-        .map(|f| build_hnsw_index(&f.keypoints))
+        .map(|f| flatten_descriptors(&f.descriptors))
         .collect();
 
     let all_matches: Vec<Match> = pairs
@@ -593,15 +625,14 @@ pub(crate) fn match_all_pairs(features: &[ImageFeatures], ratio_threshold: f32) 
                 }
             }
 
-            let matches_ij = query_2nn(
-                &indices[j],
-                &features[i].keypoints,
-                ratio_threshold,
-                DISTANCE_THRESHOLD,
-            );
+            let (qi, dim_i, _) = &flat[i];
+            let (qj, dim_j, num_j) = &flat[j];
+            let matches_ij = query_2nn(qi, qj, *dim_i, *num_j, ratio_threshold, DISTANCE_THRESHOLD);
             let matches_ji = query_2nn(
-                &indices[i],
-                &features[j].keypoints,
+                qj,
+                qi,
+                *dim_j,
+                flat[i].2,
                 ratio_threshold,
                 DISTANCE_THRESHOLD,
             );
@@ -679,6 +710,8 @@ pub(crate) fn match_all_pairs(features: &[ImageFeatures], ratio_threshold: f32) 
                     &f_mat,
                     &features[i].keypoints,
                     &features[j].keypoints,
+                    &features[i].descriptors,
+                    &features[j].descriptors,
                     &used_a,
                     &used_b,
                     GUIDED_EPIPOLAR_THRESHOLD_PX,
