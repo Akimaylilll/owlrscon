@@ -34,8 +34,10 @@ const MAX_MODEL_OVERLAP: usize = 20;
 // 多子模型重建：图像对匹配数达到该阈值才作为子模型种子
 const SUB_MODEL_MIN_MATCHES: usize = 50;
 
-// 子模型合并：共享 track 数低于该阈值时不进行对齐（避免病态缩放）
-const MIN_MERGE_SHARED_TRACKS: usize = 20;
+// 子模型合并：无共享相机、仅靠薄接缝共享 track 时，可接受的最小内点数。
+// 薄接缝的真实对应点本来就少（重复纹理污染 + 独立重建漂移），20 太苛刻，
+// 10 个内点已足以约束平面场景的相似变换。
+const MIN_MERGE_SHARED_TRACKS: usize = 10;
 
 // 增量注册时，每注册 N 张图才做一次全局 BA（局部 BA 每张都做），加速重建
 const GLOBAL_BA_EVERY: usize = 5;
@@ -1423,6 +1425,50 @@ impl Sfm {
     }
 
     // -----------------------------------------------------------------
+    //  Structure-less registration candidates
+    // -----------------------------------------------------------------
+    // Unlike find_next_images, this does NOT require `visible >=
+    // ABS_POSE_MIN_NUM_INLIERS` structure points. It returns every
+    // unregistered image that has strong *direct* feature matches
+    // (>= 2*ABS_POSE_MIN_NUM_INLIERS) against at least one already
+    // registered image, ordered by strongest match first. This lets a
+    // sub-model grow across a weak seam (few triangulated points but
+    // plenty of verified two-view matches) so that neighbouring
+    // sub-models overlap on real cameras — which is what makes the
+    // later Sim3 merge accurate.
+    fn structure_less_candidates(
+        &self,
+        index: &HashMap<(usize, usize), Vec<(usize, usize)>>,
+    ) -> Vec<usize> {
+        let registered = self.registered_images();
+        let mut scored: Vec<(usize, usize)> = (0..self.num_images)
+            .into_par_iter()
+            .filter(|&img| {
+                self.cameras[img].is_none()
+                    && !self.filtered[img]
+                    && self.reg_trials[img] < MAX_REG_TRIALS
+            })
+            .filter_map(|img| {
+                let mut best = 0usize;
+                for &ref_img in &registered {
+                    let key = if img < ref_img { (img, ref_img) } else { (ref_img, img) };
+                    let n = index.get(&key).map(|v| v.len()).unwrap_or(0);
+                    if n > best {
+                        best = n;
+                    }
+                }
+                if best >= 2 * ABS_POSE_MIN_NUM_INLIERS {
+                    Some((best, img))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().map(|(_, img)| img).collect()
+    }
+
+    // -----------------------------------------------------------------
     //  Image registration (structure-based PnP)
     // -----------------------------------------------------------------
     fn collect_2d3d(
@@ -2467,7 +2513,11 @@ fn grow_sub_model(
         let mut last_img = None;
 
         for structure_less in [false, true] {
-            let next = sfm.find_next_images(tracks, features);
+            let next = if structure_less {
+                sfm.structure_less_candidates(index)
+            } else {
+                sfm.find_next_images(tracks, features)
+            };
             for img in next {
                 let ok = if structure_less {
                     sfm.register_structure_less_image(img, tracks, features, index)
@@ -2624,6 +2674,10 @@ fn umeyama_sim3(
     let u = svd.u?;
     let v_t = svd.v_t?;
     let d = svd.singular_values;
+    // 近共线采样退化保护：第二奇异值过小说明采样点近共线，Sim3 不可靠
+    if d[1].abs() < 1e-6 * d[0].abs() {
+        return None;
+    }
     let det = (u * v_t).determinant();
     let sign = if det < 0.0 { -1.0 } else { 1.0 };
     let mut s_corr = Matrix3::identity();
@@ -2634,37 +2688,145 @@ fn umeyama_sim3(
     Some((scale, rot, trans))
 }
 
+/// 刚体变换（旋转 + 平移，尺度固定为 1）：`dst ≈ rot * src + trans`。
+/// 用于无共享相机、尺度不可靠时的薄接缝对齐（尺度由先验单独给定）。
+fn umeyama_rigid(
+    src: &[Vector3<f64>],
+    dst: &[Vector3<f64>],
+) -> Option<(Matrix3<f64>, Vector3<f64>)> {
+    let n = src.len();
+    if n < 3 {
+        return None;
+    }
+    let mx = src.iter().copied().sum::<Vector3<f64>>() / n as f64;
+    let my = dst.iter().copied().sum::<Vector3<f64>>() / n as f64;
+    let mut cov = Matrix3::zeros();
+    for (x, y) in src.iter().zip(dst.iter()) {
+        cov += (y - my) * (x - mx).transpose();
+    }
+    let svd = SVD::new(cov, true, true);
+    let u = svd.u?;
+    let v_t = svd.v_t?;
+    let d = svd.singular_values;
+    if d[1].abs() < 1e-6 * d[0].abs() {
+        return None;
+    }
+    let det = (u * v_t).determinant();
+    let sign = if det < 0.0 { -1.0 } else { 1.0 };
+    let mut s_corr = Matrix3::identity();
+    s_corr[(2, 2)] = sign;
+    let rot = u * s_corr * v_t;
+    let trans = my - rot * mx;
+    Some((rot, trans))
+}
+
 /// 鲁棒相似变换：用 RANSAC 剔除离群共享点后求 `dst ≈ scale * rot * src + trans`。
 ///
-/// 共享点过少（< [`MIN_MERGE_SHARED_TRACKS`]）或内点不足时返回 `None`，
-/// 避免用病态/污染的锚点算出错误 scale 导致子模型被缩放嵌套。
+/// `scale_prior` 用于无共享相机、仅靠薄接缝共享 track 的合并：薄接缝上自由拟合的
+/// 尺度极易被重复纹理污染（曾出现 scale=0.392 的错值，导致子模型被缩小嵌套进主模型），
+/// 因此这种情况下把尺度固定为先验值（两个子模型都做过 L1 归一化，真实尺度比应≈1），
+/// 只做刚体 RANSAC（3 点）。有共享相机时传 `None`，尺度由数据自由决定（更可靠）。
+/// 返回 `(scale, rot, trans, n_inliers)` 供上层诊断与可靠性判断。
 fn robust_sim3(
     src: &[Vector3<f64>],
     dst: &[Vector3<f64>],
-) -> Option<(f64, Matrix3<f64>, Vector3<f64>)> {
+    scale_prior: Option<f64>,
+) -> Option<(f64, Matrix3<f64>, Vector3<f64>, usize)> {
     let n = src.len();
-    if n < MIN_MERGE_SHARED_TRACKS {
+    if n < 4 {
         return None;
     }
 
-    // 自适应内点阈值：场景已 normalize 到尺度≈1，取中位半径的 2%
-    let mut radii: Vec<f64> = src.iter().map(|p| p.norm()).collect();
-    radii.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let med = radii[radii.len() / 2];
-    let threshold = (0.02 * med).max(1e-3);
+    // 内点阈值：取锚点云包围盒对角线的 2%。
+    // 注意不能用「中位半径」——子模型原点在种子图像处，共享点若集中在接缝附近
+    // （如左右两半仅沿一条薄接缝重叠），中位半径会极小，阈值被压到不合理的低值。
+    // 包围盒对角线不依赖原点位置，对薄接缝也保持合理尺度。
+    let mut lo = src[0];
+    let mut hi = src[0];
+    for p in src {
+        lo.x = lo.x.min(p.x);
+        lo.y = lo.y.min(p.y);
+        lo.z = lo.z.min(p.z);
+        hi.x = hi.x.max(p.x);
+        hi.y = hi.y.max(p.y);
+        hi.z = hi.z.max(p.z);
+    }
+    let spread = (hi - lo).norm().max(1e-3);
+    let threshold = (0.02 * spread).max(1e-3);
+    // 宽松阈值：两个独立重建在薄接缝处的真对应点会有几%的 BA 漂移，残差可能略超
+    // 紧阈值；用宽松阈值把这些点也计入，避免误判为内点不足。错误对应（重复纹理）
+    // 残差远大于此，仍会被排除。
+    let loose = (0.06 * spread).max(1e-3);
+
+    // ---- 固定尺度（刚体）路径：无共享相机时用先验尺度，避免薄接缝的尺度被污染 ----
+    if let Some(p) = scale_prior {
+        let p = p.max(1e-6);
+        // 预缩放 src，使问题变为纯刚体对齐 dst ≈ R * (p*src) + t
+        let ssrc: Vec<Vector3<f64>> = src.iter().map(|x| p * x).collect();
+
+        let mut rng = StdRng::seed_from_u64(RANSAC_SEED);
+        let mut best_inliers: Vec<usize> = Vec::new();
+        let mut best_rigid: Option<(Matrix3<f64>, Vector3<f64>)> = None;
+        for _ in 0..20000 {
+            let sample = sample(&mut rng, n, 3).into_vec();
+            let s: Vec<Vector3<f64>> = sample.iter().map(|&i| ssrc[i]).collect();
+            let d: Vec<Vector3<f64>> = sample.iter().map(|&i| dst[i]).collect();
+            let (rot, trans) = match umeyama_rigid(&s, &d) {
+                Some(v) => v,
+                None => continue,
+            };
+            let mut inliers = Vec::new();
+            for i in 0..n {
+                if (rot * ssrc[i] + trans - dst[i]).norm() < threshold {
+                    inliers.push(i);
+                }
+            }
+            if inliers.len() > best_inliers.len() {
+                best_inliers = inliers;
+                best_rigid = Some((rot, trans));
+            }
+        }
+
+        let mut rigid = best_rigid;
+        if best_inliers.len() >= 3 {
+            // 用刚性内点精化旋转与平移（尺度保持为先验值）
+            let s: Vec<Vector3<f64>> = best_inliers.iter().map(|&i| ssrc[i]).collect();
+            let d: Vec<Vector3<f64>> = best_inliers.iter().map(|&i| dst[i]).collect();
+            if let Some(v) = umeyama_rigid(&s, &d) {
+                rigid = Some(v);
+            }
+        }
+        if let Some((rot, trans)) = rigid {
+            let cnt = (0..n)
+                .filter(|&i| (rot * ssrc[i] + trans - dst[i]).norm() < loose)
+                .count();
+            if cnt >= 3 {
+                return Some((p, rot, trans, cnt));
+            }
+        }
+        println!(
+            "    robust_sim3: n={} spread={:.1} fixed-scale={:.3} no rigid consensus",
+            n, spread, p
+        );
+        return None;
+    }
 
     let mut rng = StdRng::seed_from_u64(RANSAC_SEED);
     let mut best_inliers: Vec<usize> = Vec::new();
     let mut best_sim: Option<(f64, Matrix3<f64>, Vector3<f64>)> = None;
 
-    for _ in 0..100 {
-        let sample = sample(&mut rng, n, 3).into_vec();
+    for _ in 0..1000 {
+        let sample = sample(&mut rng, n, 4).into_vec();
         let s: Vec<Vector3<f64>> = sample.iter().map(|&i| src[i]).collect();
         let d: Vec<Vector3<f64>> = sample.iter().map(|&i| dst[i]).collect();
         let (scale, rot, trans) = match umeyama_sim3(&s, &d) {
             Some(v) => v,
             None => continue,
         };
+        // scale 合理性保护：子模型都是同一相机的度量重建，scale 不应极端
+        if !(1e-2..=1e2).contains(&scale) {
+            continue;
+        }
         let mut inliers = Vec::new();
         for i in 0..n {
             let pred = scale * (rot * src[i]) + trans;
@@ -2678,85 +2840,247 @@ fn robust_sim3(
         }
     }
 
-    if best_inliers.len() < MIN_MERGE_SHARED_TRACKS {
-        return None;
+    if best_inliers.len() >= 4 {
+        // 用紧内点重跑 Umeyama 精化
+        let s: Vec<Vector3<f64>> = best_inliers.iter().map(|&i| src[i]).collect();
+        let d: Vec<Vector3<f64>> = best_inliers.iter().map(|&i| dst[i]).collect();
+        let (mut scale, mut rot, mut trans) = umeyama_sim3(&s, &d).or(best_sim).unwrap();
+        // 用宽松阈值重新统计：若更多，则再用这些点精化一次，得到更稳的 Sim3
+        let loose_inliers: Vec<usize> = (0..n)
+            .filter(|&i| (scale * (rot * src[i]) + trans - dst[i]).norm() < loose)
+            .collect();
+        if loose_inliers.len() > best_inliers.len() {
+            let s2: Vec<Vector3<f64>> = loose_inliers.iter().map(|&i| src[i]).collect();
+            let d2: Vec<Vector3<f64>> = loose_inliers.iter().map(|&i| dst[i]).collect();
+            if let Some(v) = umeyama_sim3(&s2, &d2) {
+                scale = v.0;
+                rot = v.1;
+                trans = v.2;
+            }
+        }
+        let cnt = (0..n)
+            .filter(|&i| (scale * (rot * src[i]) + trans - dst[i]).norm() < loose)
+            .count();
+        return Some((scale, rot, trans, cnt));
     }
 
-    // 用全部内点重跑 Umeyama 精化
-    let s: Vec<Vector3<f64>> = best_inliers.iter().map(|&i| src[i]).collect();
-    let d: Vec<Vector3<f64>> = best_inliers.iter().map(|&i| dst[i]).collect();
-    let refined = umeyama_sim3(&s, &d);
-    if refined.is_some() {
-        refined
-    } else {
-        best_sim
+    // RANSAC 未找到共识（薄接缝时四点最小样本命中率低）：退化为全体锚点直接最小二乘，
+    // 用中位残差判断整体是否一致，避免把内点占比较高但样本难命中的情况误判为不可合并。
+    let (s, r, t) = match umeyama_sim3(src, dst) {
+        Some(v) => v,
+        None => {
+            println!(
+                "    robust_sim3: n={} spread={:.1} best_inliers={} -> degenerate",
+                n,
+                spread,
+                best_inliers.len()
+            );
+            return None;
+        }
+    };
+    if !(1e-2..=1e2).contains(&s) {
+        println!(
+            "    robust_sim3: n={} direct-LS scale={:.3} out of range",
+            n, s
+        );
+        return None;
+    }
+    let mut res: Vec<f64> = (0..n)
+        .map(|i| (s * (r * src[i]) + t - dst[i]).norm())
+        .collect();
+    res.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med_res = res[n / 2];
+    let inliers = res.iter().filter(|&&v| v < loose).count();
+    if med_res > loose {
+        println!(
+            "    robust_sim3: n={} direct-LS median_res={:.1} > {:.1} -> reject",
+            n, med_res, loose
+        );
+        return None;
+    }
+    Some((s, r, t, inliers))
+}
+
+/// 子模型内有效点数量。
+fn submodel_point_count(s: &Sfm) -> usize {
+    s.points.iter().filter(|p| p.track_id != usize::MAX).count()
+}
+
+/// 子模型场景尺度：有效点到质心的均方根距离。
+/// 两个子模型都在 `initialize_with_pair` 做过 L1 归一化，因此各自场景尺度应接近；
+/// 两者之比是薄接缝合并时的可靠尺度先验（薄接缝自身无法可靠约束尺度）。
+fn scene_spread(s: &Sfm) -> f64 {
+    let pts: Vec<Vector3<f64>> = s
+        .points
+        .iter()
+        .filter(|p| p.track_id != usize::MAX)
+        .map(|p| p.xyz)
+        .collect();
+    if pts.len() < 2 {
+        return 1.0;
+    }
+    let mean = pts.iter().copied().sum::<Vector3<f64>>() / pts.len() as f64;
+    let var = pts.iter().map(|p| (p - mean).norm_squared()).sum::<f64>() / pts.len() as f64;
+    var.sqrt().max(1e-6)
+}
+
+/// 收集两个子模型间的共享锚点：共享 3D track + 共享相机中心。
+/// 返回 `(src, dst, n_shared_cams)`，其中 `src.len()` 为锚点总数。
+/// `src` 在 `sub` 坐标系，`dst` 在 `merged` 坐标系。
+fn collect_merge_anchors(
+    merged: &Sfm,
+    sub: &Sfm,
+) -> (Vec<Vector3<f64>>, Vec<Vector3<f64>>, usize) {
+    let mut src: Vec<Vector3<f64>> = Vec::new();
+    let mut dst: Vec<Vector3<f64>> = Vec::new();
+
+    // 1) 共享 3D track
+    for (tid, &pidx_sub) in &sub.track_to_point {
+        if let Some(&pidx_merged) = merged.track_to_point.get(tid) {
+            if sub.point_is_valid(pidx_sub) && merged.point_is_valid(pidx_merged) {
+                src.push(sub.points[pidx_sub].xyz);
+                dst.push(merged.points[pidx_merged].xyz);
+            }
+        }
+    }
+
+    // 2) 共享相机（同一张图在两个子模型里都注册了）
+    let mut n_shared_cams = 0usize;
+    for i in 0..merged.num_images {
+        if let (Some(c_m), Some(c_s)) = (&merged.cameras[i], &sub.cameras[i]) {
+            src.push(camera_center(&c_s.r, &c_s.t));
+            dst.push(camera_center(&c_m.r, &c_m.t));
+            n_shared_cams += 1;
+        }
+    }
+
+    (src, dst, n_shared_cams)
+}
+
+/// 把 `sub` 变换到 `merged` 坐标系后并入（相机补未注册的，点去重共享 track）。
+fn merge_submodel_into(
+    merged: &mut Sfm,
+    mut sub: Sfm,
+    scale: f64,
+    rot: Matrix3<f64>,
+    trans: Vector3<f64>,
+) {
+    // 变换子模型相机位姿：C' = s R C + t，R' = R R_sim^T
+    for cam in sub.cameras.iter_mut().flatten() {
+        cam.r = cam.r * rot.transpose();
+        cam.t = scale * cam.t - cam.r * trans;
+    }
+    // 变换子模型 3D 点
+    for p in sub.points.iter_mut() {
+        if p.track_id != usize::MAX {
+            p.xyz = scale * (rot * p.xyz) + trans;
+        }
+    }
+
+    // 合并相机（只补未注册的）
+    for i in 0..merged.num_images {
+        if merged.cameras[i].is_none() && sub.cameras[i].is_some() {
+            merged.cameras[i] = sub.cameras[i].clone();
+        }
+    }
+    // 合并点（去重共享 track）
+    for (tid, &pidx_sub) in &sub.track_to_point {
+        if sub.point_is_valid(pidx_sub) && !merged.track_to_point.contains_key(tid) {
+            merged.points.push(sub.points[pidx_sub].clone());
+            let new_pidx = merged.points.len() - 1;
+            merged.track_to_point.insert(*tid, new_pidx);
+        }
     }
 }
 
-/// 合并多个子模型：通过共享 track 的 3D 点计算相似变换对齐到最大子模型。
+/// 合并多个子模型：反复合并「共享锚点最多」的子模型对（而非固定以最大子模型为基准），
+/// 避免最大子模型恰好与其它子模型重叠不足时把整条链都丢弃。
+/// 共享相机中心位姿可靠，因此共享相机足够多的对可接受较少内点。
 fn merge_submodels(mut submodels: Vec<Sfm>) -> Sfm {
-    submodels.sort_by_key(|s| {
-        std::cmp::Reverse(s.points.iter().filter(|p| p.track_id != usize::MAX).count())
-    });
-    let mut merged = submodels.remove(0);
-
-    for mut sub in submodels {
-        // 收集共享 track 的 3D 点对
-        let mut src: Vec<Vector3<f64>> = Vec::new();
-        let mut dst: Vec<Vector3<f64>> = Vec::new();
-        for (tid, &pidx_sub) in &sub.track_to_point {
-            if let Some(&pidx_merged) = merged.track_to_point.get(tid) {
-                if sub.point_is_valid(pidx_sub) && merged.point_is_valid(pidx_merged) {
-                    src.push(sub.points[pidx_sub].xyz);
-                    dst.push(merged.points[pidx_merged].xyz);
+    loop {
+        if submodels.len() <= 1 {
+            break;
+        }
+        // 找共享锚点最多的一对 (bi, bj)
+        let mut bi = 0usize;
+        let mut bj = 1usize;
+        let mut bn = 0usize;
+        for i in 0..submodels.len() {
+            for j in (i + 1)..submodels.len() {
+                let (src, _, _) = collect_merge_anchors(&submodels[i], &submodels[j]);
+                if src.len() > bn {
+                    bn = src.len();
+                    bi = i;
+                    bj = j;
                 }
             }
         }
-        let (scale, rot, trans) = match robust_sim3(&src, &dst) {
+        if bn < 4 {
+            break; // 没有任何一对有足够锚点
+        }
+
+        // 以点数较多者为基准，把另一个变换并入
+        let (base, other) = if submodel_point_count(&submodels[bi])
+            >= submodel_point_count(&submodels[bj])
+        {
+            (bi, bj)
+        } else {
+            (bj, bi)
+        };
+        let sub = submodels.remove(other);
+        let base = if base > other { base - 1 } else { base };
+        let (src, dst, n_shared_cams) = collect_merge_anchors(&submodels[base], &sub);
+
+        // 有共享相机时尺度由数据自由决定（位姿可靠）；无共享相机时薄接缝无法可靠
+        // 约束尺度，改用两个子模型各自场景尺度之比作为先验，避免自由拟合出错误的
+        // 缩小/放大尺度（曾出现 scale=0.392 把子模型缩小嵌套进主模型）。
+        let scale_prior = if n_shared_cams >= 4 {
+            None
+        } else {
+            Some(scene_spread(&submodels[base]) / scene_spread(&sub))
+        };
+
+        let (scale, rot, trans, n_inliers) = match robust_sim3(&src, &dst, scale_prior) {
             Some(v) => v,
             None => {
                 println!(
-                    "  Skip merging sub-model (shared tracks={} < {}), leave it out",
-                    src.len(),
-                    MIN_MERGE_SHARED_TRACKS
+                    "  Skip merging pair ({} imgs, anchors={}): no reliable Sim3",
+                    sub.num_registered(),
+                    src.len()
                 );
-                continue;
+                // 锚点最多的一对都失败，其余更不可能成功，终止
+                submodels.push(sub);
+                break;
             }
         };
+
+        // 可靠性门槛：有共享相机（位姿可靠）时可接受较少内点；纯 track 合并要求更多
+        let min_inliers = if n_shared_cams >= 4 { 4 } else { MIN_MERGE_SHARED_TRACKS };
+        if n_inliers < min_inliers {
+            println!(
+                "  Skip merging pair ({} imgs, anchors={} inliers={} < {}): too few inliers",
+                sub.num_registered(),
+                src.len(),
+                n_inliers,
+                min_inliers
+            );
+            submodels.push(sub);
+            break;
+        }
+
         println!(
-            "  Merge sub-model: shared tracks={} scale={:.3}",
+            "  Merge sub-model: {} imgs, anchors={} ({} cams) inliers={} scale={:.3}",
+            sub.num_registered(),
             src.len(),
+            n_shared_cams,
+            n_inliers,
             scale
         );
-
-        // 变换子模型相机位姿：C' = s R C + t，R' = R R_sim^T
-        for cam in sub.cameras.iter_mut().flatten() {
-            cam.r = cam.r * rot.transpose();
-            cam.t = scale * cam.t - cam.r * trans;
-        }
-        // 变换子模型 3D 点
-        for p in sub.points.iter_mut() {
-            if p.track_id != usize::MAX {
-                p.xyz = scale * (rot * p.xyz) + trans;
-            }
-        }
-
-        // 合并相机（只补未注册的）
-        for i in 0..merged.num_images {
-            if merged.cameras[i].is_none() && sub.cameras[i].is_some() {
-                merged.cameras[i] = sub.cameras[i].clone();
-            }
-        }
-        // 合并点（去重共享 track）
-        for (tid, &pidx_sub) in &sub.track_to_point {
-            if sub.point_is_valid(pidx_sub) && !merged.track_to_point.contains_key(tid) {
-                merged.points.push(sub.points[pidx_sub].clone());
-                let new_pidx = merged.points.len() - 1;
-                merged.track_to_point.insert(*tid, new_pidx);
-            }
-        }
+        merge_submodel_into(&mut submodels[base], sub, scale, rot, trans);
     }
-    merged
+
+    // 返回点数最多的子模型作为最终结果
+    submodels.into_iter().max_by_key(submodel_point_count).unwrap()
 }
 
 /// 多子模型重建：从多个强连接图像对分别启动增量重建，再按共享 track 合并。
@@ -2778,40 +3102,44 @@ fn reconstruct_multi_model(
         .collect();
     seeds.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
 
-    // 2. 从每个种子重建一个子模型
-    let mut registered_global = vec![false; sfm.num_images];
-    let mut submodels: Vec<Sfm> = Vec::new();
-
-    for ((a, b), _n) in seeds {
-        if registered_global[a] || registered_global[b] {
-            continue;
-        }
-        let mut sub = Sfm::new(sfm.num_images, sfm.intrinsics.clone());
-        let geometry = match sub.estimate_initial_two_view_geometry(
+    // 从一个种子对重建子模型（含增量增长）；两视图初始化失败则返回 None。
+    let num_images = sfm.num_images;
+    let intrinsics = sfm.intrinsics.clone();
+    let build_submodel = |a: usize, b: usize| -> Option<Sfm> {
+        let mut sub = Sfm::new(num_images, intrinsics.clone());
+        let geometry = sub.estimate_initial_two_view_geometry(
             a,
             b,
             index,
             features,
             min_num_inliers,
             min_tri_angle,
-        ) {
-            Some(g) => g,
-            None => continue,
-        };
-        if sub.initialize_with_pair(a, b, &geometry, tracks, features, index) != SfmStatus::Success
-        {
-            continue;
+        )?;
+        if sub.initialize_with_pair(a, b, &geometry, tracks, features, index) != SfmStatus::Success {
+            return None;
         }
         grow_sub_model(&mut sub, index, features, tracks, paths);
-        let reg = sub.registered_images();
-        for img in &reg {
-            registered_global[*img] = true;
+        Some(sub)
+    };
+
+    // 2. 第一轮：主（尽量不相交）子模型。记录每张图归属哪个主子模型。
+    let mut submodel_of = vec![None; num_images];
+    let mut submodels: Vec<Sfm> = Vec::new();
+
+    for &((a, b), _n) in &seeds {
+        if submodel_of[a].is_some() || submodel_of[b].is_some() {
+            continue;
         }
-        let np = sub
-            .points
-            .iter()
-            .filter(|p| p.track_id != usize::MAX)
-            .count();
+        let sub = match build_submodel(a, b) {
+            Some(s) => s,
+            None => continue,
+        };
+        let reg = sub.registered_images();
+        let idx = submodels.len();
+        for img in &reg {
+            submodel_of[*img] = Some(idx);
+        }
+        let np = sub.points.iter().filter(|p| p.track_id != usize::MAX).count();
         println!(
             "  Sub-model seeded ({},{}) -> {} images, {} points",
             a,
@@ -2822,6 +3150,65 @@ fn reconstruct_multi_model(
         submodels.push(sub);
     }
 
+    let n_primary = submodels.len();
+
+    // 3. 第二轮：桥接子模型。两端已分属不同主子模型的强连接对（正是第一轮被跳过的
+    //    接缝对）作为桥种子，从接缝向外扩张，与两侧主模型共享相机，从而让合并阶段
+    //    有可靠的相机中心锚点，避免退化成薄接缝上的弱 Sim3。
+    if n_primary >= 2 {
+        // 把接缝种子对按 (主子模型 x, y) 分组；seeds 已按匹配数降序，每组内保留强弱顺序。
+        let mut seam_seeds: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
+        for &((a, b), _n) in &seeds {
+            let (x, y) = match (submodel_of[a], submodel_of[b]) {
+                (Some(x), Some(y)) if x < n_primary && y < n_primary && x != y => {
+                    (x.min(y), x.max(y))
+                }
+                _ => continue,
+            };
+            seam_seeds.entry((x, y)).or_default().push((a, b));
+        }
+
+        if !seam_seeds.is_empty() {
+            println!(
+                "  Bridge pass: {} seam pair(s) between primary sub-models",
+                seam_seeds.len()
+            );
+        }
+
+        for ((x, y), cands) in &seam_seeds {
+            let mut built_ok = false;
+            for &(a, b) in cands {
+                let sub = match build_submodel(a, b) {
+                    Some(s) => s,
+                    // 这个种子两视图初始化失败，换同一对子模型里下一个较弱种子再试
+                    None => continue,
+                };
+                let reg = sub.registered_images();
+                let np = sub.points.iter().filter(|p| p.track_id != usize::MAX).count();
+                println!(
+                    "  Bridge sub-model ({},{}) connects sub-models {} & {} -> {} images, {} points",
+                    a,
+                    b,
+                    x,
+                    y,
+                    reg.len(),
+                    np
+                );
+                submodels.push(sub);
+                built_ok = true;
+                break;
+            }
+            if !built_ok {
+                println!(
+                    "  Bridge FAILED for sub-model pair ({},{}) — all {} seam seed(s) failed two-view init",
+                    x,
+                    y,
+                    cands.len()
+                );
+            }
+        }
+    }
+
     if submodels.is_empty() {
         reconstruct(sfm, index, features, tracks, paths);
         return;
@@ -2829,6 +3216,11 @@ fn reconstruct_multi_model(
 
     println!("\n  Merging {} sub-models...", submodels.len());
     *sfm = merge_submodels(submodels);
+
+    // 合并后做一次全局 BA：两个半区之间若有残余尺度/漂移，靠接缝处的共享观测联合优化
+    // 校正（合并的闭式 Sim3 无法利用全部观测，只用了共享 track 的点位置）。
+    sfm.iterative_refinement(tracks, features, true, None);
+    sfm.update_point_errors(tracks, features);
 }
 
 fn build_correspondence_index(matches: &[Match]) -> HashMap<(usize, usize), Vec<(usize, usize)>> {
