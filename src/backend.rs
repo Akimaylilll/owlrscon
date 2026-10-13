@@ -7,7 +7,7 @@
 //! `mvs`) rather than here, so the same kernel source runs unchanged on the CPU,
 //! WGSL and CUDA backends.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use cubecl::client::ComputeClient;
 use cubecl::Runtime;
@@ -27,20 +27,39 @@ compile_error!("至少启用一个后端 feature：`wgpu`、`cuda` 或 `cpu`");
 /// Shared compute client for the selected backend.
 pub type Client = ComputeClient<BackendRuntime>;
 
-static CLIENT: OnceLock<Client> = OnceLock::new();
+static CLIENT: OnceLock<Mutex<Option<Client>>> = OnceLock::new();
 
-/// Lazily initialize and return the global compute client.
-pub fn client() -> &'static Client {
-    CLIENT.get_or_init(|| {
+fn client_slot() -> &'static Mutex<Option<Client>> {
+    CLIENT.get_or_init(|| Mutex::new(None))
+}
+
+/// 惰性初始化并返回全局 compute client（克隆句柄，底层共享同一设备）。
+///
+/// 返回可克隆的 [`Client`]（内部为 Arc），因此即使之后调用 [`reset_client`]
+/// 丢弃底层设备，已持有的句柄也会在各自 drop 时正常释放。
+pub fn client() -> Client {
+    let mut slot = client_slot().lock().unwrap();
+    if slot.is_none() {
         let device = Device::default();
-        BackendRuntime::client(&device)
-    })
+        *slot = Some(BackendRuntime::client(&device));
+    }
+    slot.as_ref().unwrap().clone()
+}
+
+/// 丢弃当前设备，强制下一次 [`client`] 调用重建。
+///
+/// 用于设备丢失（TDR / 驱动重置）后的恢复：已丢失的设备无法再提交，
+/// 唯一办法是丢弃重建。注意：仅当没有其它线程正在并发使用该设备时才安全
+/// （全分辨率下 MVS 并行度=1，天然满足）。
+pub fn reset_client() {
+    let mut slot = client_slot().lock().unwrap();
+    *slot = None;
 }
 
 /// Initialize the backend (and fail early if no device is available).
 pub fn init() {
     let c = client();
-    println!("Compute backend: {}", BackendRuntime::name(c));
+    println!("Compute backend: {}", BackendRuntime::name(&c));
     #[cfg(not(feature = "cpu"))]
     println!("GPU memory: {} MB", gpu_total_memory_bytes() / 1_000_000);
 }

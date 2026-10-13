@@ -724,7 +724,7 @@ fn patch_match_image_gpu(
                     .wrapping_add(color * 7);
                 unsafe {
                     pm_propagate::launch_unchecked::<crate::backend::BackendRuntime>(
-                        client,
+                        &client,
                         cube_count.clone(),
                         cube_dim,
                         ArrayArg::from_raw_parts(ref_census_handle.clone(), 3 * n),
@@ -1227,19 +1227,49 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
         (0..nc).into_par_iter().for_each(|si| {
             let (dlo, dhi) = cam_depths[si];
             let sd = sparse_depth_map(si, &cams, &sparse_pts, iw as usize, ih as usize, cx, cy);
-            let (d, n, c) = patch_match_image_gpu(
-                si,
-                &cams,
-                &neighbors[si],
-                dlo * 0.5,
-                dhi * 1.4,
-                iw as usize,
-                ih as usize,
-                cx,
-                cy,
-                num_iterations,
-                &sd,
-            );
+
+            // 设备丢失（TDR / 驱动重置）会以 panic 的形式从 wgpu 的 Device::poll 抛出，
+            // 且无法被「预检测」——只能提交后才知道。全分辨率下 MVS 并行度=1，因此这里
+            // 捕获 panic、重建设备并重试该相机，把间歇性丢失从致命崩溃降级为可恢复的重试；
+            // 重试耗尽才恢复原始 panic（保留原始 backtrace）。
+            const DEVICE_LOST_MAX_RETRIES: usize = 2;
+            let mut attempt = 0usize;
+            let (d, n, c) = loop {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    patch_match_image_gpu(
+                        si,
+                        &cams,
+                        &neighbors[si],
+                        dlo * 0.5,
+                        dhi * 1.4,
+                        iw as usize,
+                        ih as usize,
+                        cx,
+                        cy,
+                        num_iterations,
+                        &sd,
+                    )
+                }));
+                match outcome {
+                    Ok(result) => break result,
+                    Err(_) if attempt < DEVICE_LOST_MAX_RETRIES => {
+                        attempt += 1;
+                        eprintln!(
+                            "[MVS] cam {}: GPU 设备丢失（device lost），重建设备后重试 ({}/{})",
+                            si, attempt, DEVICE_LOST_MAX_RETRIES
+                        );
+                        crate::backend::reset_client();
+                    }
+                    Err(payload) => {
+                        eprintln!(
+                            "[MVS] cam {}: GPU 设备丢失（device lost），重试 {} 次后仍失败，放弃",
+                            si, DEVICE_LOST_MAX_RETRIES
+                        );
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+            };
+
             // 诊断日志（每相机）
             println!("[DEBUG] cam {} depth {}", si, depth_stats_line(&d, &c));
             println!("[DEBUG] cam {} hist  {}", si, depth_histogram(&d, 10));

@@ -122,8 +122,9 @@ pub(crate) fn extract_features(paths: &[String], first_octave: i32) -> Vec<Image
     let sift = Sift::default();
 
     // 有限并发：SIFT 每图像在 GPU 上驻留高斯金字塔+梯度+DoG（约 96 字节/像素），
-    // 按显存预算自动计算线程数，避免多图像并发提取导致 OOM
-    let per_image_bytes = (MAX_IMAGE_DIMENSION as usize).pow(2) * 96;
+    // 按显存预算自动计算线程数，避免多图像并发提取导致 OOM。
+    // 实际 sift-cubecl 并发开销比预估大（含中间缓冲/编译暂存），用更保守的 256 字节/像素压低并发。
+    let per_image_bytes = (MAX_IMAGE_DIMENSION as usize).pow(2) * 256;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(crate::backend::parallelism(per_image_bytes))
         .build()
@@ -328,7 +329,7 @@ fn nn2_match(query: &[f32], db: &[f32], dim: usize, num_db: usize) -> Vec<(usize
 
     unsafe {
         nn2_match_kernel::launch_unchecked::<f32, crate::backend::BackendRuntime>(
-            client,
+            &client,
             CubeCount::Static(num_query.div_ceil(NN2_THREADS as usize) as u32, 1, 1),
             CubeDim::new_1d(NN2_THREADS),
             ArrayArg::from_raw_parts(q_handle.clone(), query.len()),
@@ -348,6 +349,9 @@ fn nn2_match(query: &[f32], db: &[f32], dim: usize, num_db: usize) -> Vec<(usize
     let bi: &[u32] = u32::from_bytes(&bi_bytes);
     let bd: &[f32] = f32::from_bytes(&bd_bytes);
     let sd: &[f32] = f32::from_bytes(&sd_bytes);
+
+    // 释放 GPU 缓冲，避免 5050 对匹配累积导致 OOM
+    crate::backend::memory_cleanup();
 
     (0..num_query)
         .map(|i| (bi[i] as usize, bd[i], sd[i]))
