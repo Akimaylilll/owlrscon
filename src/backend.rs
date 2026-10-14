@@ -40,10 +40,18 @@ fn client_slot() -> &'static Mutex<Option<Client>> {
 pub fn client() -> Client {
     let mut slot = client_slot().lock().unwrap();
     if slot.is_none() {
-        let device = Device::default();
-        *slot = Some(BackendRuntime::client(&device));
+        *slot = Some(create_client());
     }
     slot.as_ref().unwrap().clone()
+}
+
+/// 选择并创建 compute client。
+///
+/// 统一使用 `Device::default()`（各后端默认设备）。之前曾自动选择 `DiscreteGpu(0)`，
+/// 但全分辨率 TDR 与 census-on-GPU 的错误叠加导致多层点云；效果好的历史结果是在默认
+/// 设备上算的，因此恢复默认设备选择，与已验证的正确路径保持一致。
+fn create_client() -> Client {
+    BackendRuntime::client(&Device::default())
 }
 
 /// 丢弃当前设备，强制下一次 [`client`] 调用重建。
@@ -79,6 +87,13 @@ pub fn memory_usage() -> String {
         ),
         Err(_) => "memory_usage unavailable".to_string(),
     }
+}
+
+/// 返回后端当前保留的显存字节数（`bytes_reserved`，诊断/兜底用）。
+///
+/// 设备丢失后调用会返回 `None`（此时无法查询）。
+pub fn memory_reserved_bytes() -> Option<usize> {
+    client().memory_usage().ok().map(|u| u.bytes_reserved as usize)
 }
 
 /// 探测设备总内存（字节）。CPU 后端即系统内存；GPU 后端为真实显存。

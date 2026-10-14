@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 
 use cubecl::prelude::*;
-use image::{Rgb, RgbImage};
+use image::RgbImage;
 use indicatif::{ProgressBar, ProgressStyle};
 use nalgebra::{Matrix3, Vector3};
 use rand::rngs::StdRng;
@@ -19,17 +19,6 @@ const CUBE_THREADS: u32 = 256;
 
 /// 每个参考相机用于多视图代价聚合的邻帧数。
 const N_NBR: usize = 8;
-
-/// 网格三角化步长：深度图全分辨率(5472×3648)下每相机可产生大量三角形，55 相机累计会 OOM。
-/// 按步长抽取像素，把面片数量降到可接受范围（步长 8 → 约 1/64）。
-const MESH_STEP: usize = 8;
-
-/// 纹理图集边长上限（避免烘焙阶段分配过大的图集位图）。
-const ATLAS_MAX_SIDE: u32 = 8192;
-
-/// 是否生成带纹理的三角网格（mesh.obj + mesh_texture.png）。
-/// 暂时关闭：当前重点是 dense.ply 的点云质量，网格化耗时且会干扰调优节奏。
-const ENABLE_MESH: bool = false;
 
 /// 核内 popcount（SWAR，cubecl 无内置 count_ones）。
 #[cube]
@@ -230,6 +219,8 @@ fn pm_propagate(
     cy: f32,
     iw: usize,
     ih: usize,
+    strip_h: usize,
+    y_offset: usize,
     half: usize,
     n_nbr: usize,
     dx: i32,
@@ -242,16 +233,18 @@ fn pm_propagate(
     seed: u32,
 ) {
     let idx = ABSOLUTE_POS;
+    let n_local = iw * strip_h;
     let n_px = iw * ih;
-    if idx < n_px {
+    if idx < n_local {
         let x = idx % iw;
-        let y = idx / iw;
+        let y = idx / iw + y_offset;
+        let gidx = idx + y_offset * iw;
         if (x + y) % 2 == color as usize {
-            let mut best_d = depth[idx];
-            let mut bn0 = normal[idx * 3];
-            let mut bn1 = normal[idx * 3 + 1];
-            let mut bn2 = normal[idx * 3 + 2];
-            let mut best_cost = cost[idx];
+            let mut best_d = depth[gidx];
+            let mut bn0 = normal[gidx * 3];
+            let mut bn1 = normal[gidx * 3 + 1];
+            let mut bn2 = normal[gidx * 3 + 2];
+            let mut best_cost = cost[gidx];
 
             // 传播候选：读邻像素 (x+dx, y+dy)
             let px = x as i64 + dx as i64;
@@ -276,7 +269,7 @@ fn pm_propagate(
             }
 
             // 扰动候选
-            let mut state = xorshift32(seed ^ ((idx as u64) * 2654435761u64) as u32);
+            let mut state = xorshift32(seed ^ ((gidx as u64) * 2654435761u64) as u32);
             let r1 =
                 f32::cast_from(xorshift32(state) & 0x00FF_FFFFu32) / f32::cast_from(0x00FF_FFFFu32);
             state = xorshift32(state);
@@ -303,11 +296,11 @@ fn pm_propagate(
                 best_cost = c;
             }
 
-            depth[idx] = best_d;
-            normal[idx * 3] = bn0;
-            normal[idx * 3 + 1] = bn1;
-            normal[idx * 3 + 2] = bn2;
-            cost[idx] = best_cost;
+            depth[gidx] = best_d;
+            normal[gidx * 3] = bn0;
+            normal[gidx * 3 + 1] = bn1;
+            normal[gidx * 3 + 2] = bn2;
+            cost[gidx] = best_cost;
         }
     }
 }
@@ -318,52 +311,131 @@ struct RegCam {
     r: Matrix3<f64>,
     t: Vector3<f64>,
     f: f64,
-    f_full: f64,
     gray: Vec<u8>,
     path: String,
 }
 
-/// 对灰度图（u8）计算 9×9 窗口（80 邻域）Census 码，每个像素 3 个 u32（96 位，用 80 位）。
-/// 边界外邻域按「不大于中心」处理（bit=0）。
-fn compute_census(gray: &[u8], iw: usize, ih: usize) -> Vec<u32> {
-    use rayon::prelude::*;
+/// 在 CPU 上计算 (2*half+1)×(2*half+1) 窗口的 Census 码（9×9 → 80 位，3×u32/像素，rayon 并行）。
+/// 每个邻像素与中心比较灰度：大于中心 → 位 1，否则 → 0；中心自身跳过；越界邻域按 0。
+/// 位序由本函数统一确定；Census 代价是 popcount(XOR)，对一致的字内位反转不变，故与代价核自洽。
+fn compute_census(gray: &[u8], iw: usize, ih: usize, half: usize) -> Vec<u32> {
     let n = iw * ih;
-    let mut out = vec![0u32; 3 * n];
-    out.par_chunks_mut(iw * 3).enumerate().for_each(|(y, row)| {
-        for x in 0..iw {
-            let center = gray[y * iw + x];
+    let iw_i = iw as isize;
+    let ih_i = ih as isize;
+    let half_i = half as isize;
+    let mut out = vec![0u32; n * 3];
+    out.par_chunks_mut(3)
+        .enumerate()
+        .for_each(|(idx, o)| {
+            let x = (idx % iw) as isize;
+            let y = (idx / iw) as isize;
+            let center = gray[idx] as u32;
             let mut c0 = 0u32;
             let mut c1 = 0u32;
             let mut c2 = 0u32;
-            let mut bit = 0u32;
-            for dy in -4i64..=4 {
-                for dx in -4i64..=4 {
+            for dy in -half_i..=half_i {
+                for dx in -half_i..=half_i {
                     if dx == 0 && dy == 0 {
                         continue;
                     }
-                    let nx = x as i64 + dx;
-                    let ny = y as i64 + dy;
-                    let b = if nx >= 0 && nx < iw as i64 && ny >= 0 && ny < ih as i64 {
-                        (gray[(ny as usize) * iw + nx as usize] > center) as u32
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    let b = if nx >= 0 && nx < iw_i && ny >= 0 && ny < ih_i {
+                        if gray[(ny * iw_i + nx) as usize] as u32 > center {
+                            1u32
+                        } else {
+                            0u32
+                        }
                     } else {
-                        0
+                        0u32
                     };
-                    if bit < 32 {
-                        c0 |= b << bit;
-                    } else if bit < 64 {
-                        c1 |= b << (bit - 32);
-                    } else {
-                        c2 |= b << (bit - 64);
-                    }
-                    bit += 1;
+                    // 96 位进位累加器（c2:c1:c0）：只用字面量 <<1 移位 + 进位，
+                    // 与 GPU census_from_gray 逐位一致（无运行期变长移位，无 bit 计数器）。
+                    let msb0 = c0 >> 31;
+                    let msb1 = c1 >> 31;
+                    c2 = (c2 << 1) | msb1;
+                    c1 = (c1 << 1) | msb0;
+                    c0 = (c0 << 1) | b;
                 }
             }
-            row[x * 3] = c0;
-            row[x * 3 + 1] = c1;
-            row[x * 3 + 2] = c2;
-        }
-    });
+            o[0] = c0;
+            o[1] = c1;
+            o[2] = c2;
+        });
     out
+}
+
+/// 把 u8 灰度图打包成 u32（每 u32 装 1 个灰度字节，值 0..255），供 GPU census 核读取。
+/// 1 灰度/u32 免去核内字节抽取的移位/分支（代价：灰度缓冲 4 倍，~80MB/图，9 图 ~720MB）。
+/// 注：早期诊断曾怀疑 4 字节打包 + 字节抽取是 census 全 0 的原因，后经自检读回确认灰度
+/// 上传/读回 100% 正确，并非病根；真正病根是核内嵌套 if 表达式被 cubecl 错编译（见 census_from_gray）。
+fn pack_gray_u32(gray: &[u8]) -> Vec<u32> {
+    gray.iter().map(|&g| g as u32).collect()
+}
+
+/// GPU 版 Census：每线程算一个像素的 (2*half+1)×(2*half+1) 窗口 Census 码（9×9 → 80 位，3×u32/像素）。
+///
+/// 与 host [`compute_census`] **逐位一致**（同为 96 位进位累加器 c2:c1:c0 位序）。
+/// 循环结构同已验证正确的 [`census_for_pixel`]：i64 坐标（`i64::cast_from`）+ 嵌套
+/// `-half_s..=half_s` 闭区间 range。
+///
+/// **关键约束（真正的病根）**：b 位必须用 if *语句*（`let mut b = 0u32; if .. { b = 1u32; }`）
+/// 赋值，不能用 if *表达式*（`let b = if .. { 1u32 } else { 0u32 }`）——cubecl 会把嵌套的
+/// if 表达式错编译成恒 0。三次改写（i32 扁平循环/直接灰度/i64 嵌套循环）输出逐位完全相同全 0，
+/// 正是因为三者都用了同一 if 表达式写法；改用 if 语句后 OWLRSCON_CENSUS_CHECK 逐位验证一致。
+///
+/// `out_base`：输出段起始元素偏移（参考图 = 0，第 k 邻帧 = k*3*n），把多图写进同一打包缓冲。
+#[cube(launch_unchecked)]
+fn census_from_gray(
+    gray: &Array<u32>,
+    out: &mut Array<u32>,
+    out_base: usize,
+    iw: usize,
+    ih: usize,
+    half: usize,
+) {
+    let idx = ABSOLUTE_POS;
+    let n_px = iw * ih;
+    if idx < n_px {
+        let center = gray[idx];
+        let x_s = i64::cast_from(idx % iw);
+        let y_s = i64::cast_from(idx / iw);
+        let half_s = i64::cast_from(half);
+        let iw_s = i64::cast_from(iw);
+        let ih_s = i64::cast_from(ih);
+        let mut c0 = 0u32;
+        let mut c1 = 0u32;
+        let mut c2 = 0u32;
+        for dy in -half_s..=half_s {
+            let ny = y_s + dy;
+            for dx in -half_s..=half_s {
+                let nx = x_s + dx;
+                if dx != 0 || dy != 0 {
+                    // 注意：b 必须用 if *语句*（let mut b=0; if .. { b=1 }），
+                    // 不能用 if *表达式*（let b = if .. {1} else {0}）——
+                    // cubecl 对嵌套 if 表达式会错编译成恒 0（已用 OWLRSCON_CENSUS_CHECK 逐位验证）。
+                    let mut b = 0u32;
+                    if ny >= 0 && ny < ih_s && nx >= 0 && nx < iw_s {
+                        let nidx = usize::cast_from(ny) * iw + usize::cast_from(nx);
+                        if gray[nidx] > center {
+                            b = 1u32;
+                        }
+                    }
+                    // 96 位进位累加器（c2:c1:c0）：只用字面量 <<1/>>31 + 进位，
+                    // 与 host compute_census 逐位一致。
+                    let msb0 = c0 >> 31u32;
+                    let msb1 = c1 >> 31u32;
+                    c2 = (c2 << 1u32) | msb1;
+                    c1 = (c1 << 1u32) | msb0;
+                    c0 = (c0 << 1u32) | b;
+                }
+            }
+        }
+        let o = out_base + idx * 3;
+        out[o] = c0;
+        out[o + 1] = c1;
+        out[o + 2] = c2;
+    }
 }
 
 /// 深度/代价统计（诊断用，每相机打印）。
@@ -637,15 +709,18 @@ fn patch_match_image_gpu(
     let dmin_f = dmin as f32;
     let dmax_f = dmax as f32;
 
-    // 实时计算 Census 码（9×9 80bit，3×u32/像素）：参考图 + 邻帧打包，避免常驻全部相机
-    let ref_census = compute_census(&cams[si].gray, iw, ih);
-    let mut src_census_packed = vec![0u32; n_nbr * 3 * n];
+    // 2D grid：全分辨率下 n/256 可能超过 wgpu 单维 65535 上限，用 x/y 两维分摊。
+    let groups = n.div_ceil(CUBE_THREADS as usize);
+    let gx = 512u32;
+    let gy = groups.div_ceil(gx as usize) as u32;
+    let cube_count = CubeCount::Static(gx, gy, 1);
+    let cube_dim = CubeDim::new_1d(CUBE_THREADS);
+
+    // 位姿参数（参考图 ↔ 各邻帧的 R/t/f，小数组，走 CPU 上传）。
     let mut r_sr = vec![0.0f32; n_nbr * 9];
     let mut t_sr = vec![0.0f32; n_nbr * 3];
     let mut f_src = vec![0.0f32; n_nbr];
     for (k, &ri) in neighbors.iter().enumerate() {
-        let src_c = compute_census(&cams[ri].gray, iw, ih);
-        src_census_packed[k * 3 * n..(k + 1) * 3 * n].copy_from_slice(&src_c);
         let (r, t) = relative_pose_mvs(&cams[si].r, &cams[si].t, &cams[ri].r, &cams[ri].t);
         for i in 0..3 {
             for j in 0..3 {
@@ -654,6 +729,138 @@ fn patch_match_image_gpu(
             t_sr[k * 3 + i] = t[i] as f32;
         }
         f_src[k] = cams[ri].f as f32;
+    }
+
+    // Census 码（9×9 80bit，3×u32/像素）在 GPU 上计算（census_from_gray），
+    // 与 host compute_census 逐位一致（96 位进位累加器、无变长移位、i32 坐标、越界按 0）。
+    // 灰度 1 字节/u32 上传（不做 4 字节打包/字节抽取），参考图与各邻帧分别跑核，
+    // 直接写进 GPU 打包缓冲（免 host census staging）。
+    let mut gray_handles = Vec::with_capacity(n_nbr + 1);
+
+    let ref_gray_handle = client.create_from_slice(u32::as_bytes(&pack_gray_u32(&cams[si].gray)));
+    let ref_census_handle = client.empty(3 * n * core::mem::size_of::<u32>());
+    unsafe {
+        census_from_gray::launch_unchecked::<crate::backend::BackendRuntime>(
+            &client,
+            cube_count.clone(),
+            cube_dim,
+            ArrayArg::from_raw_parts(ref_gray_handle.clone(), cams[si].gray.len()),
+            ArrayArg::from_raw_parts(ref_census_handle.clone(), 3 * n),
+            0usize,
+            iw,
+            ih,
+            4usize,
+        );
+    }
+    gray_handles.push(ref_gray_handle);
+
+    let src_census_handle = client.empty(n_nbr * 3 * n * core::mem::size_of::<u32>());
+    for (k, &ri) in neighbors.iter().enumerate() {
+        let gray_handle = client.create_from_slice(u32::as_bytes(&pack_gray_u32(&cams[ri].gray)));
+        unsafe {
+            census_from_gray::launch_unchecked::<crate::backend::BackendRuntime>(
+                &client,
+                cube_count.clone(),
+                cube_dim,
+                ArrayArg::from_raw_parts(gray_handle.clone(), cams[ri].gray.len()),
+                ArrayArg::from_raw_parts(src_census_handle.clone(), n_nbr * 3 * n),
+                k * 3 * n,
+                iw,
+                ih,
+                4usize,
+            );
+        }
+        gray_handles.push(gray_handle);
+    }
+
+    // 可选自检（OWLRSCON_CENSUS_CHECK=1）：读回参考图 GPU census，与 host compute_census 逐位比对，
+    // 一次性确认核与 host 逐位一致（全分辨率下此自检会额外分配 host census，仅用于验证）。
+    if std::env::var("OWLRSCON_CENSUS_CHECK").is_ok() {
+        let ref_host = compute_census(&cams[si].gray, iw, ih, 4usize);
+        let ref_gpu = client
+            .read_one(ref_census_handle.clone())
+            .expect("read census check");
+        let ref_gpu = u32::from_bytes(&ref_gpu).to_vec();
+        let mut bad = 0usize;
+        for i in 0..(3 * n) {
+            if ref_gpu[i] != ref_host[i] {
+                bad += 1;
+            }
+        }
+        if bad > 0 {
+            eprintln!(
+                "[ERROR] cam {}: GPU census 与 host 不一致：{} / {} 字不同",
+                si,
+                bad,
+                3 * n
+            );
+            // 打印前 3 个不一致像素的坐标与 host/GPU 三字，便于区分位序差异 vs 取值/越界错误。
+            let mut shown = 0usize;
+            for px in 0..n {
+                let base = px * 3;
+                if ref_gpu[base] != ref_host[base]
+                    || ref_gpu[base + 1] != ref_host[base + 1]
+                    || ref_gpu[base + 2] != ref_host[base + 2]
+                {
+                    eprintln!(
+                        "[ERROR]   px={} (x={}, y={}) host=[{:08x},{:08x},{:08x}] gpu=[{:08x},{:08x},{:08x}]",
+                        px,
+                        px % iw,
+                        px / iw,
+                        ref_host[base],
+                        ref_host[base + 1],
+                        ref_host[base + 2],
+                        ref_gpu[base],
+                        ref_gpu[base + 1],
+                        ref_gpu[base + 2],
+                    );
+                    shown += 1;
+                    if shown >= 3 {
+                        break;
+                    }
+                }
+            }
+        } else {
+            println!("[DEBUG] cam {}: GPU census == host census（逐位一致）", si);
+        }
+
+        // 诊断：读回 GPU 灰度，与 host pack_gray_u32 比对，区分「上传损坏」vs「核内读取/代码生成」。
+        let gray_host = pack_gray_u32(&cams[si].gray);
+        let gray_gpu = client
+            .read_one(gray_handles[0].clone())
+            .expect("read gray check");
+        let gray_gpu = u32::from_bytes(&gray_gpu).to_vec();
+        let mut gray_bad = 0usize;
+        let mut gray_nz = 0usize;
+        let ng = gray_host.len();
+        for i in 0..ng {
+            if gray_gpu[i] != gray_host[i] {
+                gray_bad += 1;
+            }
+            if gray_gpu[i] != 0 {
+                gray_nz += 1;
+            }
+        }
+        eprintln!(
+            "[CHECK] cam {}: gpu gray 非零字数 {} / {}，与 host 不一致 {} / {}",
+            si, gray_nz, ng, gray_bad, ng
+        );
+        if gray_bad > 0 {
+            for i in 0..ng {
+                if gray_gpu[i] != gray_host[i] {
+                    eprintln!(
+                        "[CHECK]   gray[{}] host={:08x} gpu={:08x}",
+                        i, gray_host[i], gray_gpu[i]
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    // 显存诊断：census 阶段结束后的保留量（若 device lost 发生在 census，此行不会出现）。
+    if let Some(res) = crate::backend::memory_reserved_bytes() {
+        println!("[DEBUG] cam {}: census done, {} MB reserved", si, res / 1_000_000);
     }
 
     // 稀疏深度先验初始化 + 连续法向初始化（小抖动，给传播/扰动留探索空间）
@@ -683,28 +890,35 @@ fn patch_match_image_gpu(
     }
     drop(normal_soa);
 
-    // 上传常驻缓冲（depth/normal 为读改写，先写初值）
+    // 上传常驻缓冲（depth/normal 为读改写，先写初值）。Census 已在 GPU 上算好，位姿走小数组上传。
     let depth_handle = client.create_from_slice(f32::as_bytes(&depth));
     let normal_handle = client.create_from_slice(f32::as_bytes(&normal_flat));
-    let cost_handle = client.empty(n * core::mem::size_of::<f32>());
-    let ref_census_handle = client.create_from_slice(u32::as_bytes(&ref_census));
-    let src_census_handle = client.create_from_slice(u32::as_bytes(&src_census_packed));
+    // cost 必须在 host 侧显式初始化成“比任何真实代价都差”的值（-1.0 = 本工程的无效哨兵，
+    // 真实 Census 相似度 ∈ [-1,1]）。pm_propagate 里 `best_cost = cost[idx]` 是先读后写，
+    // 若用 `client.empty()`（未初始化显存，内容依赖 GPU/驱动，机器间不一致且常为 NaN/超大值），
+    // 则 `c > best_cost` 恒为假 → 传播/扰动永远不更新 → 深度停在稀疏先验，产生多层点云。
+    let cost_handle = client.create_from_slice(f32::as_bytes(&vec![-1.0f32; n]));
     let r_handle = client.create_from_slice(f32::as_bytes(&r_sr));
     let t_handle = client.create_from_slice(f32::as_bytes(&t_sr));
     let f_handle = client.create_from_slice(f32::as_bytes(&f_src));
-    drop(src_census_packed);
-    drop(ref_census);
     drop(normal_flat);
     drop(depth);
 
-    // 2D grid：全分辨率下 n/256 可能超过 wgpu 单维 65535 上限，用 x/y 两维分摊
-    let groups = n.div_ceil(CUBE_THREADS as usize);
-    let gx = 512u32;
-    let gy = groups.div_ceil(gx as usize) as u32;
-    let cube_count = CubeCount::Static(gx, gy, 1);
-    let cube_dim = CubeDim::new_1d(CUBE_THREADS);
+    if let Some(res) = crate::backend::memory_reserved_bytes() {
+        println!("[DEBUG] cam {}: uploads done, {} MB reserved", si, res / 1_000_000);
+    }
 
     // 红黑迭代：传播 + 扰动
+    // 分 strip（整宽行带，128 行/带）+ 每次 launch 后 sync()：避免 wgpu/DX12 把全部
+    // pm_propagate launch 合成一个 >2s 的命令列表触发 Windows TDR（"Parent device is lost"）。
+    // 红黑传播只读反色邻像素（本 pass 内不被修改），故 strip 顺序执行与整图一次执行逐位等价；
+    // 扰动 RNG 用全局 gidx 做种子，与整图版完全一致（确定性不变）。
+    const STRIP_H: usize = 128;
+    let n_strips = ih.div_ceil(STRIP_H);
+
+    // 迭代前先 sync 一次，确保 census 与 uploads 已真正提交执行（不再积压在命令队列）。
+    client.sync();
+
     for iter in 0..num_iterations {
         let d_perturb = (dmax_f - dmin_f) * 0.5f32.powi(iter as i32);
         let n_perturb = 0.5f32.powi(iter as i32 + 1);
@@ -722,44 +936,65 @@ fn patch_match_image_gpu(
                     .wrapping_add(iter as u32 * 131)
                     .wrapping_add(dir * 17)
                     .wrapping_add(color * 7);
-                unsafe {
-                    pm_propagate::launch_unchecked::<crate::backend::BackendRuntime>(
-                        &client,
-                        cube_count.clone(),
-                        cube_dim,
-                        ArrayArg::from_raw_parts(ref_census_handle.clone(), 3 * n),
-                        ArrayArg::from_raw_parts(src_census_handle.clone(), n_nbr * 3 * n),
-                        ArrayArg::from_raw_parts(r_handle.clone(), n_nbr * 9),
-                        ArrayArg::from_raw_parts(t_handle.clone(), n_nbr * 3),
-                        ArrayArg::from_raw_parts(f_handle.clone(), n_nbr),
-                        ArrayArg::from_raw_parts(depth_handle.clone(), n),
-                        ArrayArg::from_raw_parts(normal_handle.clone(), 3 * n),
-                        ArrayArg::from_raw_parts(cost_handle.clone(), n),
-                        cams[si].f as f32,
-                        cx as f32,
-                        cy as f32,
-                        iw,
-                        ih,
-                        patch_half,
-                        n_nbr,
-                        dx,
-                        dy,
-                        color,
-                        dmin_f,
-                        dmax_f,
-                        d_perturb,
-                        n_perturb,
-                        seed,
-                    );
+                for s in 0..n_strips {
+                    let y0 = s * STRIP_H;
+                    let h = STRIP_H.min(ih - y0);
+                    let sgroups = (iw * h).div_ceil(CUBE_THREADS as usize);
+                    let sgx = 512u32;
+                    let sgy = sgroups.div_ceil(sgx as usize).max(1) as u32;
+                    let strip_count = CubeCount::Static(sgx, sgy, 1);
+                    unsafe {
+                        pm_propagate::launch_unchecked::<crate::backend::BackendRuntime>(
+                            &client,
+                            strip_count,
+                            cube_dim,
+                            ArrayArg::from_raw_parts(ref_census_handle.clone(), 3 * n),
+                            ArrayArg::from_raw_parts(src_census_handle.clone(), n_nbr * 3 * n),
+                            ArrayArg::from_raw_parts(r_handle.clone(), n_nbr * 9),
+                            ArrayArg::from_raw_parts(t_handle.clone(), n_nbr * 3),
+                            ArrayArg::from_raw_parts(f_handle.clone(), n_nbr),
+                            ArrayArg::from_raw_parts(depth_handle.clone(), n),
+                            ArrayArg::from_raw_parts(normal_handle.clone(), 3 * n),
+                            ArrayArg::from_raw_parts(cost_handle.clone(), n),
+                            cams[si].f as f32,
+                            cx as f32,
+                            cy as f32,
+                            iw,
+                            ih,
+                            h,
+                            y0,
+                            patch_half,
+                            n_nbr,
+                            dx,
+                            dy,
+                            color,
+                            dmin_f,
+                            dmax_f,
+                            d_perturb,
+                            n_perturb,
+                            seed,
+                        );
+                    }
+                    client.sync();
                 }
             }
         }
     }
 
     // 读回
+    if let Some(res) = crate::backend::memory_reserved_bytes() {
+        println!("[DEBUG] cam {}: pm done, {} MB reserved", si, res / 1_000_000);
+    }
     let depth_bytes = client.read_one(depth_handle).expect("read depth");
     let normal_bytes = client.read_one(normal_handle).expect("read normal");
     let cost_bytes = client.read_one(cost_handle).expect("read cost");
+    // 显式释放仍存活的大缓冲（Census/位姿），再归还显存池，避免跨相机累积逼近显存上限。
+    drop(ref_census_handle);
+    drop(src_census_handle);
+    drop(r_handle);
+    drop(t_handle);
+    drop(f_handle);
+    drop(gray_handles);
     let depth = f32::from_bytes(&depth_bytes).to_vec();
     let normal_flat_out = f32::from_bytes(&normal_bytes).to_vec();
     let cost = f32::from_bytes(&cost_bytes).to_vec();
@@ -782,6 +1017,21 @@ fn patch_match_image_gpu(
 /// 达到 min_consistent 个一致视角才保留该点（仿 COLMAP StereoFusion 的几何一致性）。
 ///
 /// `nbr_depths`/`nbr_normals` 与 `neighbors` 一一对应。
+/// 稠密点：世界系坐标 + 世界系法向（朝相机/朝外，由深度图反算）+ 颜色。
+/// 法向是网格重建的关键输入，随点云一起贯穿去重/滤波/MLS 并写进 dense.ply。
+#[derive(Clone, Copy)]
+struct DensePt {
+    x: f64,
+    y: f64,
+    z: f64,
+    nx: f64,
+    ny: f64,
+    nz: f64,
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
 fn fuse_camera(
     si: usize,
     cams: &[RegCam],
@@ -800,11 +1050,11 @@ fn fuse_camera(
     depth_err_px: f64,
     min_consistent: usize,
     max_normal_error: f64,
-) -> Vec<(f64, f64, f64, u8, u8, u8)> {
+) -> Vec<DensePt> {
     let max_normal_cos = max_normal_error.cos();
     let f = cams[si].f;
     let r_w = cams[si].r.transpose();
-    let mut fused: Vec<(f64, f64, f64, u8, u8, u8)> = Vec::new();
+    let mut fused: Vec<DensePt> = Vec::new();
     for y in 0..ih {
         for x in 0..iw {
             let idx = y * iw + x;
@@ -853,7 +1103,17 @@ fn fuse_camera(
                 continue;
             }
             let pix = color.get_pixel(x as u32, y as u32);
-            fused.push((xw.x, xw.y, xw.z, pix[0], pix[1], pix[2]));
+            fused.push(DensePt {
+                x: xw.x,
+                y: xw.y,
+                z: xw.z,
+                nx: nw.x,
+                ny: nw.y,
+                nz: nw.z,
+                r: pix[0],
+                g: pix[1],
+                b: pix[2],
+            });
         }
     }
     fused
@@ -919,13 +1179,23 @@ fn mls_project(points: &[(f64, f64, f64)], h: f64) -> Vec<(f64, f64, f64)> {
     out
 }
 
-/// MLS 平滑（带颜色版本）
-fn mls_smooth(points: &[(f64, f64, f64, u8, u8, u8)], h: f64) -> Vec<(f64, f64, f64, u8, u8, u8)> {
-    let pos: Vec<(f64, f64, f64)> = points.iter().map(|&(x, y, z, _, _, _)| (x, y, z)).collect();
+/// MLS 平滑（带颜色 + 法向版本）：仅投影坐标，法向/颜色保持不变。
+fn mls_smooth_pts(points: &[DensePt], h: f64) -> Vec<DensePt> {
+    let pos: Vec<(f64, f64, f64)> = points.iter().map(|p| (p.x, p.y, p.z)).collect();
     let proj = mls_project(&pos, h);
     proj.into_iter()
         .zip(points.iter())
-        .map(|((x, y, z), &(_, _, _, r, g, b))| (x, y, z, r, g, b))
+        .map(|((x, y, z), p)| DensePt {
+            x,
+            y,
+            z,
+            nx: p.nx,
+            ny: p.ny,
+            nz: p.nz,
+            r: p.r,
+            g: p.g,
+            b: p.b,
+        })
         .collect()
 }
 
@@ -1082,7 +1352,6 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
             r,
             t,
             f: f_full / scale as f64,
-            f_full,
             gray: gray_u8,
             path: paths[img_idx].clone(),
         });
@@ -1270,6 +1539,25 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
                 }
             };
 
+            // 显存诊断 + 兜底：若清理后仍保留过高（跨相机累积），重建设备强制归还全部显存。
+            if let Some(reserved) = crate::backend::memory_reserved_bytes() {
+                let total = crate::backend::gpu_total_memory_bytes();
+                println!(
+                    "[DEBUG] cam {} mem {} MB reserved / {} MB total",
+                    si,
+                    reserved / 1_000_000,
+                    total / 1_000_000
+                );
+                if reserved > total / 4 {
+                    eprintln!(
+                        "[MVS] cam {}: 显存保留 {} MB 偏高，重建设备归还显存",
+                        si,
+                        reserved / 1_000_000
+                    );
+                    crate::backend::reset_client();
+                }
+            }
+
             // 诊断日志（每相机）
             println!("[DEBUG] cam {} depth {}", si, depth_stats_line(&d, &c));
             println!("[DEBUG] cam {} hist  {}", si, depth_histogram(&d, 10));
@@ -1286,7 +1574,7 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
 
     // 融合：逐相机从盘读回（带 LRU 缓存），反投影 + 邻帧深度一致性
     let n_px = iw as usize * ih as usize;
-    let mut all_pts: Vec<(f64, f64, f64, u8, u8, u8)> = Vec::new();
+    let mut all_pts: Vec<DensePt> = Vec::new();
     let mut cache: HashMap<usize, (Vec<f32>, Vec<[f32; 3]>, Vec<f32>)> = HashMap::new();
     for si in 0..nc {
         let mut needed: Vec<usize> = Vec::with_capacity(neighbors[si].len() + 1);
@@ -1351,8 +1639,8 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
     println!("  fused {} points", all_pts.len());
     // 用稀疏点云包围盒约束：剔除场景外漂浮噪声
     if let Some((lo, hi)) = sparse_bbox {
-        all_pts.retain(|(x, y, z, _, _, _)| {
-            *x > lo.x && *x < hi.x && *y > lo.y && *y < hi.y && *z > lo.z && *z < hi.z
+        all_pts.retain(|p| {
+            p.x > lo.x && p.x < hi.x && p.y > lo.y && p.y < hi.y && p.z > lo.z && p.z < hi.z
         });
         println!(
             "  bbox constraint: {} points within sparse bounds [{:.1},{:.1},{:.1}]~[{:.1},{:.1},{:.1}]",
@@ -1386,17 +1674,19 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
                 .push(i);
         }
         let before = all_pts.len();
-        all_pts.retain(|(x, y, z, _, _, _)| {
-            let cx = (*x / cell) as i64;
-            let cy = (*y / cell) as i64;
-            let cz = (*z / cell) as i64;
+        all_pts.retain(|pt| {
+            let cx = (pt.x / cell) as i64;
+            let cy = (pt.y / cell) as i64;
+            let cz = (pt.z / cell) as i64;
             for dz in -2i64..=2 {
                 for dy in -2i64..=2 {
                     for dx in -2i64..=2 {
                         if let Some(ids) = sgrid.get(&(cx + dx, cy + dy, cz + dz)) {
                             for &j in ids {
                                 let p = sparse_pts[j];
-                                if (x - p.x).powi(2) + (y - p.y).powi(2) + (z - p.z).powi(2)
+                                if (pt.x - p.x).powi(2)
+                                    + (pt.y - p.y).powi(2)
+                                    + (pt.z - p.z).powi(2)
                                     < max_dist * max_dist
                                 {
                                     return true;
@@ -1416,55 +1706,73 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
         );
     }
 
-    let mut xs: Vec<f64> = all_pts.iter().map(|(x, _, _, _, _, _)| *x).collect();
-    let mut ys: Vec<f64> = all_pts.iter().map(|(_, y, _, _, _, _)| *y).collect();
-    let mut zs: Vec<f64> = all_pts.iter().map(|(_, _, z, _, _, _)| *z).collect();
+    let mut xs: Vec<f64> = all_pts.iter().map(|p| p.x).collect();
+    let mut ys: Vec<f64> = all_pts.iter().map(|p| p.y).collect();
+    let mut zs: Vec<f64> = all_pts.iter().map(|p| p.z).collect();
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
     zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let (mx, my, mz) = (xs[xs.len() / 2], ys[ys.len() / 2], zs[zs.len() / 2]);
     let mut dists: Vec<f64> = all_pts
         .iter()
-        .map(|(x, y, z, _, _, _)| ((x - mx).powi(2) + (y - my).powi(2) + (z - mz).powi(2)).sqrt())
+        .map(|p| ((p.x - mx).powi(2) + (p.y - my).powi(2) + (p.z - mz).powi(2)).sqrt())
         .collect();
     dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let med = dists[dists.len() / 2];
     let max_d = (med * 5.0).max(med + 1.0);
-    all_pts.retain(|(x, y, z, _, _, _)| {
-        ((x - mx).powi(2) + (y - my).powi(2) + (z - mz).powi(2)).sqrt() < max_d
+    all_pts.retain(|p| {
+        ((p.x - mx).powi(2) + (p.y - my).powi(2) + (p.z - mz).powi(2)).sqrt() < max_d
     });
 
     // 体素尺寸随场景尺度自适应（约为中位半径的 1%），避免点云过稀疏
     let vs = (med * 0.01).max(0.01);
-    let mut vox: BTreeMap<(i64, i64, i64), (usize, f64, f64, f64, u64, u64, u64)> = BTreeMap::new();
-    for (x, y, z, r, g, b) in &all_pts {
+    // (count, sx, sy, sz, snx, sny, snz, sr, sg, sb)
+    let mut vox: BTreeMap<(i64, i64, i64), (usize, f64, f64, f64, f64, f64, f64, u64, u64, u64)> =
+        BTreeMap::new();
+    for p in &all_pts {
         let e = vox
             .entry((
-                (x / vs).round() as i64,
-                (y / vs).round() as i64,
-                (z / vs).round() as i64,
+                (p.x / vs).round() as i64,
+                (p.y / vs).round() as i64,
+                (p.z / vs).round() as i64,
             ))
             .or_default();
         e.0 += 1;
-        e.1 += x;
-        e.2 += y;
-        e.3 += z;
-        e.4 += *r as u64;
-        e.5 += *g as u64;
-        e.6 += *b as u64;
+        e.1 += p.x;
+        e.2 += p.y;
+        e.3 += p.z;
+        e.4 += p.nx;
+        e.5 += p.ny;
+        e.6 += p.nz;
+        e.7 += p.r as u64;
+        e.8 += p.g as u64;
+        e.9 += p.b as u64;
     }
-    // 体素去重，保留体素坐标用于邻域统计
-    let dedup_vox: Vec<((i64, i64, i64), f64, f64, f64, u8, u8, u8)> = vox
+    // 体素去重，保留体素坐标用于邻域统计；法向平均后重新归一。
+    let dedup_vox: Vec<((i64, i64, i64), DensePt)> = vox
         .into_iter()
-        .map(|((vx, vy, vz), (n, sx, sy, sz, sr, sg, sb))| {
+        .map(|((vx, vy, vz), (n, sx, sy, sz, snx, sny, snz, sr, sg, sb))| {
+            let n = n as f64;
+            let (nx, ny, nz) = (snx / n, sny / n, snz / n);
+            let nl = (nx * nx + ny * ny + nz * nz).sqrt();
+            let (nx, ny, nz) = if nl < 1e-12 {
+                (0.0, 0.0, 1.0)
+            } else {
+                (nx / nl, ny / nl, nz / nl)
+            };
             (
                 (vx, vy, vz),
-                sx / n as f64,
-                sy / n as f64,
-                sz / n as f64,
-                (sr / n as u64) as u8,
-                (sg / n as u64) as u8,
-                (sb / n as u64) as u8,
+                DensePt {
+                    x: sx / n,
+                    y: sy / n,
+                    z: sz / n,
+                    nx,
+                    ny,
+                    nz,
+                    r: (sr / n as u64) as u8,
+                    g: (sg / n as u64) as u8,
+                    b: (sb / n as u64) as u8,
+                },
             )
         })
         .collect();
@@ -1474,12 +1782,12 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
     let k_nn = 8usize;
     let std_mult = 0.5f64;
     let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
-    for (i, ((vx, vy, vz), ..)) in dedup_vox.iter().enumerate() {
+    for (i, ((vx, vy, vz), _)) in dedup_vox.iter().enumerate() {
         grid.entry((*vx, *vy, *vz)).or_default().push(i);
     }
     let n_pts = dedup_vox.len();
     let mut mean_dists: Vec<f64> = vec![0.0; n_pts];
-    for (i, ((vx, vy, vz), x, y, z, ..)) in dedup_vox.iter().enumerate() {
+    for (i, ((vx, vy, vz), p)) in dedup_vox.iter().enumerate() {
         let mut dists: Vec<f64> = Vec::new();
         'outer: for rad in 1i64..=4 {
             for dz in -rad..=rad {
@@ -1493,9 +1801,10 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
                                 if j == i {
                                     continue;
                                 }
-                                let (xj, yj, zj) = (dedup_vox[j].1, dedup_vox[j].2, dedup_vox[j].3);
+                                let q = &dedup_vox[j].1;
                                 dists.push(
-                                    ((x - xj).powi(2) + (y - yj).powi(2) + (z - zj).powi(2)).sqrt(),
+                                    ((p.x - q.x).powi(2) + (p.y - q.y).powi(2) + (p.z - q.z).powi(2))
+                                        .sqrt(),
                                 );
                                 if dists.len() >= k_nn {
                                     break 'outer;
@@ -1523,21 +1832,24 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
     let var_md =
         finite.iter().map(|d| (d - mean_md).powi(2)).sum::<f64>() / finite.len().max(1) as f64;
     let threshold = mean_md + std_mult * var_md.sqrt();
-    let dedup: Vec<(f64, f64, f64, u8, u8, u8)> = dedup_vox
+    let dedup: Vec<DensePt> = dedup_vox
         .into_iter()
         .zip(mean_dists)
         .filter(|(_, md)| *md < threshold)
-        .map(|(((_, _, _), x, y, z, r, g, b), _)| (x, y, z, r, g, b))
+        .map(|(((_, _, _), p), _)| p)
         .collect();
 
-    // MLS 平滑：把每个点投影到局部拟合平面上，消除表面毛刺
+    // MLS 平滑：把每个点投影到局部拟合平面上，消除表面毛刺（法向保持不变，仅平移点）
     let mls_h = (vs * 3.0).max(0.03);
-    let dedup = mls_smooth(&dedup, mls_h);
+    let dedup = mls_smooth_pts(&dedup, mls_h);
     println!("  MLS smoothing applied (h={:.3})", mls_h);
 
-    let mut ply = format!("ply\nformat ascii 1.0\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n", dedup.len());
-    for (x, y, z, r, g, b) in &dedup {
-        ply.push_str(&format!("{} {} {} {} {} {}\n", x, y, z, r, g, b));
+    let mut ply = format!("ply\nformat ascii 1.0\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nproperty float nx\nproperty float ny\nproperty float nz\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n", dedup.len());
+    for p in &dedup {
+        ply.push_str(&format!(
+            "{} {} {} {} {} {} {} {} {}\n",
+            p.x, p.y, p.z, p.nx, p.ny, p.nz, p.r, p.g, p.b
+        ));
     }
     fs::write("dense.ply", &ply).unwrap();
     println!(
@@ -1547,388 +1859,6 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
         ply.len() as f64 / 1024.0
     );
 
-    // 网格化暂时关闭：专注 dense.ply 的点云质量。需要时把 ENABLE_MESH 改回 true。
-    if !ENABLE_MESH {
-        return;
-    }
-
-    // ===== 网格化：稀疏点云距离约束（逐相机读盘后内联过滤）=====
-    let (sgrid, smax_dist, scell): (Option<HashMap<(i64, i64, i64), Vec<usize>>>, f64, f64) =
-        if sparse_pts.is_empty() {
-            (None, 0.0, 0.0)
-        } else {
-            let max_dist = (median_depth * 0.06).max(0.1);
-            let cell = max_dist;
-            let mut sgrid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
-            for (i, p) in sparse_pts.iter().enumerate() {
-                sgrid
-                    .entry((
-                        (p.x / cell) as i64,
-                        (p.y / cell) as i64,
-                        (p.z / cell) as i64,
-                    ))
-                    .or_default()
-                    .push(i);
-            }
-            (Some(sgrid), max_dist, cell)
-        };
-
-    // ===== 贴图模型：深度图网格三角化 + 单张纹理图集烘焙 =====
-    println!("\n===== Building textured mesh =====");
-
-    struct Face {
-        v: [Vector3<f64>; 3],
-        uv: [(f64, f64); 3],
-        cam: usize,
-    }
-    let mut faces: Vec<Face> = Vec::new();
-    for si in 0..nc {
-        let (mut depth, _normal, costs) = read_depth_map(si, n_px);
-        let r_w = cams[si].r.transpose();
-        // 稀疏距离过滤（内联，替代原来的整图过滤）
-        if let Some(sgrid) = &sgrid {
-            let f = cams[si].f;
-            for y in 0..ih {
-                for x in 0..iw {
-                    let idx = (y * iw + x) as usize;
-                    let d = depth[idx];
-                    if d <= 0.0 {
-                        continue;
-                    }
-                    let d_f = d as f64;
-                    let u = (x as f64 - cx) / f;
-                    let v = (y as f64 - cy) / f;
-                    let xc = Vector3::new(u * d_f, v * d_f, d_f);
-                    let xw = r_w * (xc - cams[si].t);
-                    let cxg = (xw.x / scell) as i64;
-                    let cyg = (xw.y / scell) as i64;
-                    let czg = (xw.z / scell) as i64;
-                    let mut ok = false;
-                    'search: for dz in -2i64..=2 {
-                        for dy in -2i64..=2 {
-                            for dx in -2i64..=2 {
-                                if let Some(ids) = sgrid.get(&(cxg + dx, cyg + dy, czg + dz)) {
-                                    for &j in ids {
-                                        let p = sparse_pts[j];
-                                        if (xw.x - p.x).powi(2)
-                                            + (xw.y - p.y).powi(2)
-                                            + (xw.z - p.z).powi(2)
-                                            < smax_dist * smax_dist
-                                        {
-                                            ok = true;
-                                            break 'search;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if !ok {
-                        depth[idx] = 0.0;
-                    }
-                }
-            }
-        }
-
-        let mut wg: Vec<Vec<Option<Vector3<f64>>>> = vec![vec![None; iw as usize]; ih as usize];
-        let mut dg: Vec<Vec<f64>> = vec![vec![0.0; iw as usize]; ih as usize];
-        for y in 0..ih {
-            for x in 0..iw {
-                let d = depth[(y * iw + x) as usize];
-                let score = costs[(y * iw + x) as usize];
-                if d <= 0.0 || score < cost_min {
-                    continue;
-                }
-                let d_f = d as f64;
-                let u = (x as f64 - cx) / cams[si].f;
-                let v = (y as f64 - cy) / cams[si].f;
-                let xc = Vector3::new(u * d_f, v * d_f, d_f);
-                let xw = r_w * (xc - cams[si].t);
-                wg[y as usize][x as usize] = Some(xw);
-                dg[y as usize][x as usize] = d_f;
-            }
-        }
-        for y in (0..ih as usize - 1).step_by(MESH_STEP) {
-            for x in (0..iw as usize - 1).step_by(MESH_STEP) {
-                let a = wg[y][x];
-                let b = wg[y][x + 1];
-                let c = wg[y + 1][x];
-                let d = wg[y + 1][x + 1];
-                if a.is_none() || b.is_none() || c.is_none() || d.is_none() {
-                    continue;
-                }
-                let da = dg[y][x];
-                let db = dg[y][x + 1];
-                let dc = dg[y + 1][x];
-                let dd = dg[y + 1][x + 1];
-                let dmin = da.min(db).min(dc).min(dd);
-                let dmax = da.max(db).max(dc).max(dd);
-                if dmin <= 0.0 || (dmax - dmin) / dmin > 0.1 {
-                    continue;
-                }
-                let (a, b, c, d) = (a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap());
-                // 两个三角形：a-b-c 与 b-d-c（法向朝相机）
-                for tri in [&[a, b, c][..], &[b, d, c][..]] {
-                    let mut uv = [(0.0f64, 0.0f64); 3];
-                    let mut ok = true;
-                    for (i, xw) in tri.iter().enumerate() {
-                        let xc = cams[si].r * xw + cams[si].t;
-                        if xc.z <= 1e-6 {
-                            ok = false;
-                            break;
-                        }
-                        uv[i] = (
-                            cams[si].f_full * xc.x / xc.z + cx_full,
-                            cams[si].f_full * xc.y / xc.z + cy_full,
-                        );
-                    }
-                    if ok {
-                        faces.push(Face {
-                            v: [tri[0], tri[1], tri[2]],
-                            uv,
-                            cam: si,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    println!("  {} triangles", faces.len());
-    if faces.is_empty() {
-        return;
-    }
-
-    // ---- 跨相机顶点融合：体素去重（共享顶点，消除相邻相机表面重叠/z-fighting）----
-    let n_pts = faces.len() * 3;
-    let (mut mx, mut my, mut mz) = (0.0f64, 0.0f64, 0.0f64);
-    for fa in &faces {
-        for v in &fa.v {
-            mx += v.x;
-            my += v.y;
-            mz += v.z;
-        }
-    }
-    mx /= n_pts as f64;
-    my /= n_pts as f64;
-    mz /= n_pts as f64;
-    let mut dists: Vec<f64> = Vec::with_capacity(n_pts);
-    for fa in &faces {
-        for v in &fa.v {
-            dists.push(((v.x - mx).powi(2) + (v.y - my).powi(2) + (v.z - mz).powi(2)).sqrt());
-        }
-    }
-    dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med_d = dists[dists.len() / 2];
-    let vs = (med_d * 0.01).max(1e-3);
-    println!("  voxel size = {:.4} (median radius {:.2})", vs, med_d);
-
-    let mut vpos: Vec<(f64, f64, f64)> = Vec::new();
-    let mut vmap: HashMap<(i64, i64, i64), usize> = HashMap::new();
-    let mut face_vi: Vec<[usize; 3]> = Vec::with_capacity(faces.len());
-    for fa in &faces {
-        let mut idx = [0usize; 3];
-        for (i, v) in fa.v.iter().enumerate() {
-            let key = (
-                (v.x / vs).round() as i64,
-                (v.y / vs).round() as i64,
-                (v.z / vs).round() as i64,
-            );
-            let id = *vmap.entry(key).or_insert_with(|| {
-                vpos.push((v.x, v.y, v.z));
-                vpos.len() - 1
-            });
-            idx[i] = id;
-        }
-        face_vi.push(idx);
-    }
-    println!("  {} unique vertices (from {})", vpos.len(), n_pts);
-
-    // MLS 平滑网格顶点（与 dense.ply 保持一致）
-    let mls_h_mesh = (vs * 3.0).max(0.03);
-    vpos = mls_project(&vpos, mls_h_mesh);
-    println!("  mesh vertices MLS smoothed (h={:.3})", mls_h_mesh);
-
-    // ---- 三角形去重：按 (排序顶点索引) 去重，去掉跨相机完全重叠的三角面 ----
-    use std::collections::HashSet;
-    let mut seen: HashSet<(usize, usize, usize)> = HashSet::new();
-    let mut kept: Vec<usize> = Vec::new();
-    for (fi, idx) in face_vi.iter().enumerate() {
-        let (a, b, c) = (idx[0], idx[1], idx[2]);
-        if a == b || b == c || a == c {
-            continue;
-        }
-        let mut s = [a, b, c];
-        s.sort_unstable();
-        if seen.insert((s[0], s[1], s[2])) {
-            kept.push(fi);
-        }
-    }
-    println!(
-        "  {} unique faces (removed {} duplicate/degenerate)",
-        kept.len(),
-        faces.len() - kept.len()
-    );
-
-    // 每个保留三角形在源图像中的包围盒 + padding
-    let pad: u32 = 2;
-    struct Rect {
-        fi: usize,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-        min_u: f64,
-        min_v: f64,
-    }
-    let mut rects: Vec<Rect> = Vec::with_capacity(kept.len());
-    for &fi in &kept {
-        let fa = &faces[fi];
-        let min_u = fa.uv.iter().map(|q| q.0).fold(f64::INFINITY, f64::min);
-        let max_u = fa.uv.iter().map(|q| q.0).fold(f64::NEG_INFINITY, f64::max);
-        let min_v = fa.uv.iter().map(|q| q.1).fold(f64::INFINITY, f64::min);
-        let max_v = fa.uv.iter().map(|q| q.1).fold(f64::NEG_INFINITY, f64::max);
-        let w = (max_u - min_u).ceil() as u32 + 1 + 2 * pad;
-        let h = (max_v - min_v).ceil() as u32 + 1 + 2 * pad;
-        rects.push(Rect {
-            fi,
-            x: 0,
-            y: 0,
-            w,
-            h,
-            min_u,
-            min_v,
-        });
-    }
-    // 图集尺寸：按总面积开方再取 2 的幂
-    let total_area: u64 = rects.iter().map(|r| (r.w as u64) * (r.h as u64)).sum();
-    let mut atlas_side = (total_area as f64).sqrt().ceil() as u32;
-    atlas_side = atlas_side.max(512).min(ATLAS_MAX_SIDE).next_power_of_two();
-    // shelf 打包（按高度降序）
-    rects.sort_by(|a, b| b.h.cmp(&a.h));
-    let mut cur_x = 0u32;
-    let mut cur_y = 0u32;
-    let mut shelf_h = 0u32;
-    for r in rects.iter_mut() {
-        if r.w > atlas_side || r.h > atlas_side {
-            r.x = u32::MAX;
-            continue;
-        }
-        if cur_x + r.w > atlas_side {
-            cur_x = 0;
-            cur_y += shelf_h;
-            shelf_h = 0;
-        }
-        if cur_y + r.h > atlas_side {
-            r.x = u32::MAX;
-            continue;
-        }
-        r.x = cur_x;
-        r.y = cur_y;
-        cur_x += r.w;
-        shelf_h = shelf_h.max(r.h);
-    }
-
-    // 烘焙：把每个三角形从源图像光栅化到图集
-    let mut atlas_img = RgbImage::from_pixel(atlas_side, atlas_side, Rgb([0, 0, 0]));
-    let mut src_cache: HashMap<usize, RgbImage> = HashMap::new();
-    for r in &rects {
-        if r.x == u32::MAX {
-            continue;
-        }
-        let fa = &faces[r.fi];
-        let src = match src_cache.entry(fa.cam) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let im = image::open(&cams[fa.cam].path).unwrap().to_rgb8();
-                e.insert(im)
-            }
-        };
-        let (u0, v0) = fa.uv[0];
-        let (u1, v1) = fa.uv[1];
-        let (u2, v2) = fa.uv[2];
-        let max_u = fa.uv.iter().map(|q| q.0).fold(f64::NEG_INFINITY, f64::max);
-        let max_v = fa.uv.iter().map(|q| q.1).fold(f64::NEG_INFINITY, f64::max);
-        let area = (u1 - u0) * (v2 - v0) - (u2 - u0) * (v1 - v0);
-        if area.abs() < 1e-9 {
-            continue;
-        }
-        let sgn = if area > 0.0 { 1.0 } else { -1.0 };
-        let bx0 = r.min_u.floor() as i64 - 1;
-        let bx1 = max_u.ceil() as i64 + 1;
-        let by0 = r.min_v.floor() as i64 - 1;
-        let by1 = max_v.ceil() as i64 + 1;
-        for py in by0..=by1 {
-            for px in bx0..=bx1 {
-                if px < 0 || px >= src.width() as i64 || py < 0 || py >= src.height() as i64 {
-                    continue;
-                }
-                let fx = px as f64 + 0.5;
-                let fy = py as f64 + 0.5;
-                let w0 = ((u1 - u0) * (fy - v0) - (v1 - v0) * (fx - u0)) * sgn;
-                let w1 = ((u2 - u1) * (fy - v1) - (v2 - v1) * (fx - u1)) * sgn;
-                let w2 = ((u0 - u2) * (fy - v2) - (v0 - v2) * (fx - u2)) * sgn;
-                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                    continue;
-                }
-                let ax = ((r.x + pad) as f64 + (fx - r.min_u)).floor() as u32;
-                let ay = ((r.y + pad) as f64 + (fy - r.min_v)).floor() as u32;
-                if ax >= atlas_side || ay >= atlas_side {
-                    continue;
-                }
-                let sp = src.get_pixel(px as u32, py as u32);
-                atlas_img.put_pixel(ax, ay, *sp);
-            }
-        }
-    }
-
-    // 写 mesh.obj：共享顶点 v + 每面角独立的 vt（UV 接缝处理）
-    let mut obj = String::new();
-    obj.push_str("# Textured mesh from MVS\nmtllib mesh.mtl\nusemtl mvs_tex\no MVS_Mesh\n");
-    for (x, y, z) in &vpos {
-        obj.push_str(&format!("v {:.6} {:.6} {:.6}\n", x, y, z));
-    }
-    let mut vt_count = 0usize;
-    let mut n_written = 0usize;
-    for r in &rects {
-        if r.x == u32::MAX {
-            continue;
-        }
-        let fa = &faces[r.fi];
-        let vi = &face_vi[r.fi];
-        for i in 0..3 {
-            let u = ((r.x + pad) as f64 + (fa.uv[i].0 - r.min_u)) / atlas_side as f64;
-            let v = 1.0 - ((r.y + pad) as f64 + (fa.uv[i].1 - r.min_v)) / atlas_side as f64;
-            obj.push_str(&format!("vt {:.6} {:.6}\n", u, v));
-        }
-        obj.push_str(&format!(
-            "f {}/{} {}/{} {}/{}\n",
-            vi[0] + 1,
-            vt_count + 1,
-            vi[1] + 1,
-            vt_count + 2,
-            vi[2] + 1,
-            vt_count + 3
-        ));
-        vt_count += 3;
-        n_written += 1;
-    }
-    fs::write("mesh.obj", &obj).expect("Failed to write mesh.obj");
-    fs::write(
-        "mesh.mtl",
-        "newmtl mvs_tex\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nmap_Kd mesh_texture.png\n",
-    )
-    .expect("Failed to write mesh.mtl");
-    atlas_img
-        .save("mesh_texture.png")
-        .expect("Failed to write mesh_texture.png");
-    println!(
-        "Mesh: {} faces ({} dropped), {} vertices, atlas {}x{}, -> mesh.obj + mesh_texture.png",
-        n_written,
-        kept.len() - n_written,
-        vpos.len(),
-        atlas_side,
-        atlas_side
-    );
 }
 
 fn relative_pose_mvs(

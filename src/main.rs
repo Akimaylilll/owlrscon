@@ -1,6 +1,7 @@
 mod backend;
 mod imgproc;
 mod matching;
+mod mesh;
 mod mvs;
 mod sfm;
 mod tracks;
@@ -47,6 +48,8 @@ enum Stage {
     Coverage,
     Sfm,
     Mvs,
+    Mesh,
+    All,
 }
 
 fn parse_stage(s: &str) -> Stage {
@@ -56,7 +59,9 @@ fn parse_stage(s: &str) -> Stage {
         "tracks" | "track" => Stage::Tracks,
         "coverage" => Stage::Coverage,
         "sfm" => Stage::Sfm,
-        "mvs" | "all" => Stage::Mvs,
+        "mvs" => Stage::Mvs,
+        "mesh" | "obj" => Stage::Mesh,
+        "all" => Stage::All,
         other => {
             eprintln!("Unknown stage '{}', defaulting to 'mvs'", other);
             Stage::Mvs
@@ -103,12 +108,28 @@ fn parse_args() -> (String, i32, Stage) {
     (dir, first_octave, stage)
 }
 
+/// 从已有的 dense.ply 重建网格 → mesh.obj（2.5D DSM 高度场 + 顶点色）。
+/// 在 MVS 之后由 `-stage=mesh` / `-stage=all` 调用（两者都跑完整管线 SfM → MVS → mesh）。
+fn build_mesh_from_dense_ply() {
+    let (pts, _normals, colors) = crate::mesh::load_ply_xyz_normal("dense.ply");
+    if pts.is_empty() {
+        eprintln!("dense.ply 为空或不存在");
+        return;
+    }
+    crate::mesh::build_mesh_dsm(
+        &pts,
+        colors.as_deref(),
+        &crate::mesh::DsmOptions::default(),
+        "mesh.obj",
+    );
+}
+
 fn main() {
     let total_start = Instant::now();
 
-    backend::init();
-
     let (image_dir, first_octave, stage) = parse_args();
+
+    backend::init();
 
     let paths = load_image_paths(&image_dir);
     if paths.is_empty() {
@@ -154,8 +175,15 @@ fn main() {
     }
 
     // MVS Dense Reconstruction
-    // 计算两相机间相对位姿
     run_mvs_dense(&paths);
+    if stage <= Stage::Mvs {
+        let total_elapsed = total_start.elapsed();
+        println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());
+        return;
+    }
+
+    // `-stage=mesh` / `-stage=all`：MVS 之后接着做网格重建。
+    build_mesh_from_dense_ply();
     let total_elapsed = total_start.elapsed();
     println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());
 }
