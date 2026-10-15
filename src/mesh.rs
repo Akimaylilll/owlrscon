@@ -33,6 +33,11 @@ const DSM_MIN_PTS: u32 = 3;
 const DSM_MED_K: usize = 3;
 const DSM_MED_PASSES: usize = 1;
 
+/// 中值滤波的边保护容差：邻点与中心高度差超过该值即视为跨越陡边（墙/台阶），
+/// 不纳入该格的中值统计——中值滤波因此只压平面噪声、不抹平竖直墙。
+/// 取 0.5：与 [`DSM_STRUCT_THRESH`] 一致；深度噪声 ±0.15 远小于此、真实墙高差远大于此。
+const DSM_MED_EDGE_TOL: f64 = 0.5;
+
 /// 结构清理：高度超出局部地面该阈值即视为"抬升结构"。
 const DSM_STRUCT_THRESH: f64 = 0.5;
 
@@ -272,8 +277,10 @@ fn dsm_fill(hgt: &mut [f64], foot: &[bool], nx: usize, ny: usize) {
     }
 }
 
-/// 高度场 k×k 中值滤波（多遍）：压掉逐格噪声尖峰，同时保留比核宽得多的屋顶/地形。
-/// 空（NEG_INFINITY）格点既不参与统计、也不会被填充。逐遍读取快照、写回，保证确定性。
+/// 高度场 k×k 中值滤波（多遍）：压掉逐格噪声尖峰，但**跨陡边不混值**——只把与中心
+/// 高度差 ≤ [`DSM_MED_EDGE_TOL`] 的邻点纳入统计，屋顶/地面不互相拉低/抬高，竖直墙
+/// 得以保留。空（NEG_INFINITY）格点既不参与统计、也不会被填充。逐遍读取快照、写回，
+/// 保证确定性。
 fn dsm_median_filter(hgt: &mut [f64], nx: usize, ny: usize, k: usize, passes: usize) {
     let idx = |i: usize, j: usize| i * (ny + 1) + j;
     let r = (k / 2) as isize;
@@ -283,27 +290,33 @@ fn dsm_median_filter(hgt: &mut [f64], nx: usize, ny: usize, k: usize, passes: us
         for i in 0..=nx {
             for j in 0..=ny {
                 let kk = idx(i, j);
-                if src[kk] == f64::NEG_INFINITY {
+                let c = src[kk];
+                if c == f64::NEG_INFINITY {
                     continue;
                 }
+                // 中心始终纳入：陡边上的孤立格点没有同侧邻点，若被邻居中值改写会
+                // 反过来抹掉墙顶/墙脚。取 [中心 + 同侧邻点] 的中值 → 平处平滑、陡边保边。
                 buf.clear();
+                buf.push(c);
                 for di in -r..=r {
                     for dj in -r..=r {
+                        if di == 0 && dj == 0 {
+                            continue;
+                        }
                         let ni = i as isize + di;
                         let nj = j as isize + dj;
                         if ni < 0 || nj < 0 || ni > nx as isize || nj > ny as isize {
                             continue;
                         }
                         let nk = idx(ni as usize, nj as usize);
-                        if src[nk] != f64::NEG_INFINITY {
-                            buf.push(src[nk]);
+                        let v = src[nk];
+                        if v != f64::NEG_INFINITY && (v - c).abs() <= DSM_MED_EDGE_TOL {
+                            buf.push(v);
                         }
                     }
                 }
-                if !buf.is_empty() {
-                    buf.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    hgt[kk] = buf[buf.len() / 2];
-                }
+                buf.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                hgt[kk] = buf[buf.len() / 2];
             }
         }
     }
@@ -316,8 +329,9 @@ fn dsm_median_filter(hgt: &mut [f64], nx: usize, ny: usize, k: usize, passes: us
 /// 是抬高的平台，墙面由相邻格点间的竖直边天然补齐，屋顶因此与地面连成一体。
 ///
 /// 步骤：包围盒 → 每格取**中位数**高度（而非 max-z，稳健抗逐格离群）→ 剔除稀疏格点
-/// （点数 < DSM_MIN_PTS）→ 足迹膨胀闭合小孔 → 高度扩散填洞 → k×k 中值滤波压噪声尖峰
-/// → 结构清理（压掉支撑点过少的孤立抬升柱，消除"石林/针状面"）→ 稀疏尖峰压平
+/// （点数 < DSM_MIN_PTS）→ 足迹膨胀闭合小孔 → 高度扩散填洞 → k×k 边保护中值滤波压
+/// 噪声尖峰（跨陡边不混值、不抹竖直墙）→ 结构清理（压掉支撑点过少的孤立抬升柱，
+/// 消除"石林/针状面"）→ 稀疏尖峰压平
 /// （压掉支撑不足却高出 8 邻域的针状柱体格点）→ 平缓空洞填补（填平内部边界高差小的
 /// 道路/缓坡缺口，崖面缺口保持为洞）→ 网格三角化 → 最大连通分量 → 顶点着色 →
 /// 写 OBJ。全程确定性（固定遍历顺序）。
@@ -411,7 +425,7 @@ pub fn build_mesh_dsm(
     // ---- 4) 高度扩散填洞 ----
     dsm_fill(&mut hgt, &foot, nx, ny);
 
-    // ---- 5) k×k 中值滤波：压掉逐格噪声尖峰，保留成片屋顶/地形 ----
+    // ---- 5) k×k 边保护中值滤波：压掉逐格噪声尖峰，跨陡边不混值（不抹竖直墙） ----
     dsm_median_filter(&mut hgt, nx, ny, DSM_MED_K, DSM_MED_PASSES);
 
     // ---- 6) 结构清理：压掉支撑点过少的孤立抬升柱（"石林/针状面"根因） ----

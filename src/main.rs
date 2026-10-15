@@ -3,6 +3,7 @@ mod imgproc;
 mod matching;
 mod mesh;
 mod mvs;
+mod ortho;
 mod sfm;
 mod texture;
 mod tracks;
@@ -51,6 +52,7 @@ enum Stage {
     Mvs,
     Mesh,
     Texture,
+    Ortho,
     All,
 }
 
@@ -64,6 +66,7 @@ fn parse_stage(s: &str) -> Stage {
         "mvs" => Stage::Mvs,
         "mesh" | "obj" => Stage::Mesh,
         "texture" | "tex" => Stage::Texture,
+        "ortho" | "orthophoto" => Stage::Ortho,
         "all" => Stage::All,
         other => {
             eprintln!("Unknown stage '{}', defaulting to 'mvs'", other);
@@ -193,8 +196,16 @@ fn main() {
         return;
     }
 
-    // `-stage=texture` / `-stage=all`：网格之后贴真实图像（独立模块，读取 mesh.obj）。
-    crate::texture::run_texture(&paths);
+    // 贴图与正射影像相互独立，都只依赖 mesh 阶段产物（mesh.obj + 相机 + 深度图），
+    // 按 stage 显式调度，互不依赖：-stage=texture 只贴图、-stage=ortho 只正射、-stage=all 都做。
+    match stage {
+        Stage::Texture | Stage::All => crate::texture::run_texture(&paths),
+        _ => {}
+    }
+    match stage {
+        Stage::Ortho | Stage::All => crate::ortho::run_ortho(&paths),
+        _ => {}
+    }
     let total_elapsed = total_start.elapsed();
     println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());
 }
