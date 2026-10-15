@@ -4,6 +4,7 @@ mod matching;
 mod mesh;
 mod mvs;
 mod sfm;
+mod texture;
 mod tracks;
 mod types;
 
@@ -49,6 +50,7 @@ enum Stage {
     Sfm,
     Mvs,
     Mesh,
+    Texture,
     All,
 }
 
@@ -61,6 +63,7 @@ fn parse_stage(s: &str) -> Stage {
         "sfm" => Stage::Sfm,
         "mvs" => Stage::Mvs,
         "mesh" | "obj" => Stage::Mesh,
+        "texture" | "tex" => Stage::Texture,
         "all" => Stage::All,
         other => {
             eprintln!("Unknown stage '{}', defaulting to 'mvs'", other);
@@ -109,7 +112,7 @@ fn parse_args() -> (String, i32, Stage) {
 }
 
 /// 从已有的 dense.ply 重建网格 → mesh.obj（2.5D DSM 高度场 + 顶点色）。
-/// 在 MVS 之后由 `-stage=mesh` / `-stage=all` 调用（两者都跑完整管线 SfM → MVS → mesh）。
+/// 在 MVS 之后由 `-stage=mesh` / `-stage=texture` / `-stage=all` 调用。
 fn build_mesh_from_dense_ply() {
     let (pts, _normals, colors) = crate::mesh::load_ply_xyz_normal("dense.ply");
     if pts.is_empty() {
@@ -182,8 +185,16 @@ fn main() {
         return;
     }
 
-    // `-stage=mesh` / `-stage=all`：MVS 之后接着做网格重建。
+    // `-stage=mesh` / `-stage=texture` / `-stage=all`：MVS 之后接着做网格重建。
     build_mesh_from_dense_ply();
+    if stage <= Stage::Mesh {
+        let total_elapsed = total_start.elapsed();
+        println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());
+        return;
+    }
+
+    // `-stage=texture` / `-stage=all`：网格之后贴真实图像（独立模块，读取 mesh.obj）。
+    crate::texture::run_texture(&paths);
     let total_elapsed = total_start.elapsed();
     println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());
 }
