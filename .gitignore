@@ -6,6 +6,7 @@
 *.json
 *.mtl
 *.png
+!docs/*.png
 
 /.idea
 .DS_Store
