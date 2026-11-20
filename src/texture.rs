@@ -81,8 +81,8 @@ fn tri_area_px(p: &[[f64; 2]; 3]) -> f64 {
 }
 
 /// 从 camera_poses.json 加载相机（与 mvs.rs 一致：feature-res f/cx/cy → 全分辨率）。
-fn load_cams(paths: &[String]) -> Result<Vec<Cam>, String> {
-    let s = fs::read_to_string("camera_poses.json").map_err(|e| format!("camera_poses.json: {e}"))?;
+fn load_cams(paths: &[String], poses_path: &str) -> Result<Vec<Cam>, String> {
+    let s = fs::read_to_string(poses_path).map_err(|e| format!("camera_poses.json: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| e.to_string())?;
     let poses = v["poses"].as_array().ok_or("no poses array")?;
     if poses.len() < 2 {
@@ -142,9 +142,9 @@ fn load_cams(paths: &[String]) -> Result<Vec<Cam>, String> {
 }
 
 /// 只读深度图缓存的前 n 个 f32（depth）与第 4n 起 n 个 f32（cost），跳过法向，节省内存。
-fn read_depth_cost(si: usize, n: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+fn read_depth_cost(si: usize, n: usize, dm_dir: &str) -> Option<(Vec<f32>, Vec<f32>)> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = fs::File::open(format!("{}/{}.bin", crate::types::MVS_DM_DIR, si)).ok()?;
+    let mut f = fs::File::open(format!("{}/{}.bin", dm_dir, si)).ok()?;
     let mut dbuf = vec![0u8; n * 4];
     f.read_exact(&mut dbuf).ok()?;
     // 布局：depth(n) + normal(3n) + cost(n)，cost 从第 4n 个 f32（字节 16n）起。
@@ -260,20 +260,20 @@ fn load_mesh_obj(path: &str) -> Option<(Vec<Vector3<f64>>, Vec<[usize; 3]>)> {
 
 /// 贴图独立入口：读取 mesh.obj（网格阶段产物）+ camera_poses.json + 原图 + MVS 深度图，
 /// 写出 `mesh_textured.glb`。与 MVS 管线解耦，只消费其磁盘产物。
-pub fn run_texture(paths: &[String]) {
-    let Some((verts, tris)) = load_mesh_obj("mesh.obj") else {
+pub fn run_texture(paths: &[String], out: &crate::types::Paths) {
+    let Some((verts, tris)) = load_mesh_obj(&out.mesh_obj()) else {
         eprintln!("  [texture] mesh.obj 不存在或为空，请先跑 -stage=mesh 生成网格");
         return;
     };
-    texture_mesh(paths, &verts, &tris, "mesh_textured");
+    texture_mesh(paths, &verts, &tris, out);
 }
 
-/// 给 DSM 网格贴真实图像，写出 `{out_prefix}.glb`（内嵌图集纹理）。
+/// 给 DSM 网格贴真实图像，写出 `mesh_textured.glb`（内嵌图集纹理）。
 fn texture_mesh(
     paths: &[String],
     verts: &[Vector3<f64>],
     tris: &[[usize; 3]],
-    out_prefix: &str,
+    out: &crate::types::Paths,
 ) {
     let nt = tris.len();
     if nt == 0 || verts.is_empty() {
@@ -281,7 +281,7 @@ fn texture_mesh(
         return;
     }
 
-    let cams = match load_cams(paths) {
+    let cams = match load_cams(paths, &out.camera_poses_json()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("  [texture] 无法加载相机: {e}，跳过纹理贴图");
@@ -320,7 +320,7 @@ fn texture_mesh(
     for ci in 0..nc {
         let cam = &cams[ci];
         let n_px = (cam.w as usize) * (cam.h as usize);
-        let Some((depth, cost)) = read_depth_cost(ci, n_px) else {
+        let Some((depth, cost)) = read_depth_cost(ci, n_px, &out.mvs_dm_dir()) else {
             cams_no_depth += 1; // 该相机无深度图，跳过
             continue;
         };
@@ -657,7 +657,7 @@ fn texture_mesh(
     }
 
     // ---- 写出 GLB（单一二进制 glTF，内嵌图集纹理） ----
-    let glb_path = format!("{out_prefix}.glb");
+    let glb_path = out.mesh_textured_glb();
     write_glb(
         verts,
         tris,

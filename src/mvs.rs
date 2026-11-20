@@ -635,42 +635,116 @@ fn sparse_depth_map(
         }
     }
 
-    // 2) 邻域扩散：把稀疏深度向四周扩散，形成粗糙先验
-    for _ in 0..8 {
-        let mut next = depth.clone();
-        for y in 0..ih {
-            for x in 0..iw {
-                let idx = y * iw + x;
-                if depth[idx] != 0.0 {
+    // 2) 粗格局部表面先验：把稀疏深度按 16px 粗格取中位 → 4 邻域扩散填满粗格 → 5×5 中值
+    // 平滑 → 双线性上采样回全分辨率（只填空像素，散射点保留）。这样空隙填的是「局部地形」
+    // 而不是全局中位深度（全局中位在地形起伏下偏 ±20m，会把 PatchMatch 初始化为一个薄层）。
+    let gw = (iw + 15) / 16;
+    let gh = (ih + 15) / 16;
+    let mut grid: Vec<Vec<f32>> = vec![Vec::new(); gw * gh];
+    for y in 0..ih {
+        for x in 0..iw {
+            let d = depth[y * iw + x];
+            if d > 0.0 {
+                grid[(y / 16) * gw + (x / 16)].push(d);
+            }
+        }
+    }
+    let mut gmed: Vec<f32> = vec![0.0; gw * gh];
+    for (k, g) in grid.iter().enumerate() {
+        if !g.is_empty() {
+            let mut g = g.clone();
+            g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            gmed[k] = g[g.len() / 2];
+        }
+    }
+    // 粗格扩散填满
+    for _ in 0..(gw.max(gh) + gh) {
+        let mut next = gmed.clone();
+        for y in 0..gh {
+            for x in 0..gw {
+                let k = y * gw + x;
+                if gmed[k] != 0.0 {
                     continue;
                 }
                 let mut sum = 0.0f32;
-                let mut cnt = 0;
-                if x > 0 && depth[idx - 1] != 0.0 {
-                    sum += depth[idx - 1];
+                let mut cnt = 0i32;
+                if x > 0 && gmed[k - 1] != 0.0 {
+                    sum += gmed[k - 1];
                     cnt += 1;
                 }
-                if x + 1 < iw && depth[idx + 1] != 0.0 {
-                    sum += depth[idx + 1];
+                if x + 1 < gw && gmed[k + 1] != 0.0 {
+                    sum += gmed[k + 1];
                     cnt += 1;
                 }
-                if y > 0 && depth[idx - iw] != 0.0 {
-                    sum += depth[idx - iw];
+                if y > 0 && gmed[k - gw] != 0.0 {
+                    sum += gmed[k - gw];
                     cnt += 1;
                 }
-                if y + 1 < ih && depth[idx + iw] != 0.0 {
-                    sum += depth[idx + iw];
+                if y + 1 < gh && gmed[k + gw] != 0.0 {
+                    sum += gmed[k + gw];
                     cnt += 1;
                 }
                 if cnt > 0 {
-                    next[idx] = sum / cnt as f32;
+                    next[k] = sum / cnt as f32;
                 }
             }
         }
-        depth = next;
+        gmed = next;
     }
-
-    // 3) 仍未覆盖的像素用非零中位深度填充
+    // 5×5 中值平滑（2 遍，压块状噪声）
+    for _ in 0..2 {
+        let sm = gmed.clone();
+        for y in 0..gh {
+            for x in 0..gw {
+                let mut win: Vec<f32> = Vec::new();
+                for dy in -2i64..=2 {
+                    for dx in -2i64..=2 {
+                        let xx = x as i64 + dx;
+                        let yy = y as i64 + dy;
+                        if xx >= 0 && yy >= 0 && xx < gw as i64 && yy < gh as i64 {
+                            let v = sm[yy as usize * gw + xx as usize];
+                            if v > 0.0 {
+                                win.push(v);
+                            }
+                        }
+                    }
+                }
+                win.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                if !win.is_empty() {
+                    gmed[y * gw + x] = win[win.len() / 2];
+                }
+            }
+        }
+    }
+    // 双线性上采样填空像素
+    for y in 0..ih {
+        for x in 0..iw {
+            let idx = y * iw + x;
+            if depth[idx] != 0.0 {
+                continue;
+            }
+            let gx = x as f64 / 16.0;
+            let gy = y as f64 / 16.0;
+            let x0 = gx.floor() as usize;
+            let y0 = gy.floor() as usize;
+            let x1 = (x0 + 1).min(gw - 1);
+            let y1 = (y0 + 1).min(gh - 1);
+            let fx = gx - x0 as f64;
+            let fy = gy - y0 as f64;
+            let d00 = gmed[y0 * gw + x0];
+            let d10 = gmed[y0 * gw + x1];
+            let d01 = gmed[y1 * gw + x0];
+            let d11 = gmed[y1 * gw + x1];
+            if d00 > 0.0 && d10 > 0.0 && d01 > 0.0 && d11 > 0.0 {
+                let d = (1.0 - fx) * (1.0 - fy) * d00 as f64
+                    + fx * (1.0 - fy) * d10 as f64
+                    + (1.0 - fx) * fy * d01 as f64
+                    + fx * fy * d11 as f64;
+                depth[idx] = d as f32;
+            }
+        }
+    }
+    // 3) 极少数仍未覆盖的像素（粗格全空）用非零中位深度兜底
     let mut nz: Vec<f32> = depth.iter().copied().filter(|&d| d > 0.0).collect();
     if nz.is_empty() {
         return depth;
@@ -1200,6 +1274,7 @@ fn mls_smooth_pts(points: &[DensePt], h: f64) -> Vec<DensePt> {
 }
 
 /// 深度图落盘目录。
+#[allow(dead_code)]
 const DM_DIR: &str = crate::types::MVS_DM_DIR;
 /// 融合阶段内存中的图缓存上限（张）。
 const FUSION_CACHE_CAP: usize = 16;
@@ -1251,20 +1326,20 @@ fn bilateral_smooth(depth: &[f32], gray: &[u8], iw: usize, ih: usize) -> Vec<f32
 }
 
 /// 单相机深度图写盘：depth(n) + normal(n×3) + costs(n)，全部 f32。
-fn write_depth_map(si: usize, depth: &[f32], normal: &[[f32; 3]], costs: &[f32]) {
+fn write_depth_map(si: usize, depth: &[f32], normal: &[[f32; 3]], costs: &[f32], dm_dir: &str) {
     let mut flat: Vec<f32> = Vec::with_capacity(depth.len() * 5);
     flat.extend_from_slice(depth);
     for nrm in normal {
         flat.extend_from_slice(nrm);
     }
     flat.extend_from_slice(costs);
-    let _ = fs::create_dir_all(DM_DIR);
-    fs::write(format!("{}/{}.bin", DM_DIR, si), f32::as_bytes(&flat)).unwrap();
+    let _ = fs::create_dir_all(dm_dir);
+    fs::write(format!("{}/{}.bin", dm_dir, si), f32::as_bytes(&flat)).unwrap();
 }
 
 /// 单相机深度图读盘。
-fn read_depth_map(si: usize, n: usize) -> (Vec<f32>, Vec<[f32; 3]>, Vec<f32>) {
-    let buf = fs::read(format!("{}/{}.bin", DM_DIR, si)).unwrap();
+fn read_depth_map(si: usize, n: usize, dm_dir: &str) -> (Vec<f32>, Vec<[f32; 3]>, Vec<f32>) {
+    let buf = fs::read(format!("{}/{}.bin", dm_dir, si)).unwrap();
     let flat: &[f32] = f32::from_bytes(&buf);
     let depth = flat[..n].to_vec();
     let normal = (0..n)
@@ -1278,9 +1353,9 @@ fn read_depth_map(si: usize, n: usize) -> (Vec<f32>, Vec<[f32; 3]>, Vec<f32>) {
 }
 
 /// MVS稠密重建：平面扫描64层ZNCC→LRC几何一致性→深度图融合→体素去重→三角网格→ply+obj
-pub(crate) fn run_mvs_dense(paths: &[String]) {
+pub(crate) fn run_mvs_dense(paths: &[String], out: &crate::types::Paths) {
     println!("\n============ MVS Dense Reconstruction ============");
-    let pose_str = match fs::read_to_string("camera_poses.json") {
+    let pose_str = match fs::read_to_string(out.camera_poses_json()) {
         Ok(s) => s,
         Err(_) => {
             println!("No camera_poses.json");
@@ -1369,7 +1444,7 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
     let mut median_depth = 20.0f64;
     let mut sparse_bbox: Option<(Vector3<f64>, Vector3<f64>)> = None;
     let mut sparse_pts: Vec<Vector3<f64>> = Vec::new();
-    if let Ok(sp) = fs::read_to_string("sparse.ply") {
+    if let Ok(sp) = fs::read_to_string(out.sparse_ply()) {
         for line in sp.lines().skip(10) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 6 {
@@ -1396,19 +1471,26 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
         );
 
         if sparse_pts.len() > 20 {
-            // 用稀疏点云包围盒约束稠密重建，剔除飘在场景外的噪声
+            // 用「相机中心包围盒」约束稠密重建（多视角覆盖区），只保留图像中心点以内的点，
+            // 包围盒外只有边缘相机单视角、精度无保证，直接剔除。z 方向用 sparse 的包围盒
+            // （地面高度范围），x/y 用相机中心包围盒。
             let mut mn = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
             let mut mx = Vector3::new(f64::MIN, f64::MIN, f64::MIN);
-            for pt in &sparse_pts {
-                mn = mn.inf(pt);
-                mx = mx.sup(pt);
+            for c in &cam_centers {
+                mn = mn.inf(c);
+                mx = mx.sup(c);
             }
-            let extent = mx - mn;
-            let margin = Vector3::new(
-                (extent.x.abs() * 0.2).max(1.0),
-                (extent.y.abs() * 0.2).max(1.0),
-                (extent.z.abs() * 0.2).max(1.0),
-            );
+            // z 方向用 sparse 的高度范围（地面），x/y 用相机中心范围
+            let mut smn = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
+            let mut smx = Vector3::new(f64::MIN, f64::MIN, f64::MIN);
+            for pt in &sparse_pts {
+                smn = smn.inf(pt);
+                smx = smx.sup(pt);
+            }
+            mn.z = smn.z;
+            mx.z = smx.z;
+            // 严格相机中心包围盒，不加余量（只保留多视角覆盖区）
+            let margin = Vector3::new(0.0, 0.0, 0.0);
             sparse_bbox = Some((mn - margin, mx + margin));
 
             for ci in 0..nc {
@@ -1562,14 +1644,14 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
             println!("[DEBUG] cam {} depth {}", si, depth_stats_line(&d, &c));
             println!("[DEBUG] cam {} hist  {}", si, depth_histogram(&d, 10));
             let d = bilateral_smooth(&d, &cams[si].gray, iw as usize, ih as usize);
-            write_depth_map(si, &d, &n, &c);
+            write_depth_map(si, &d, &n, &c, &out.mvs_dm_dir());
             pb.inc(1);
         });
     });
     pb.finish_and_clear();
     println!(
         "  depth maps computed + median filtered -> {} ({} cameras)",
-        DM_DIR, nc
+        out.mvs_dm_dir(), nc
     );
 
     // 融合：逐相机从盘读回（带 LRU 缓存），反投影 + 邻帧深度一致性
@@ -1582,7 +1664,7 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
         needed.extend_from_slice(&neighbors[si]);
         for &m in &needed {
             if !cache.contains_key(&m) {
-                cache.insert(m, read_depth_map(m, n_px));
+                cache.insert(m, read_depth_map(m, n_px, &out.mvs_dm_dir()));
             }
         }
         {
@@ -1851,7 +1933,7 @@ pub(crate) fn run_mvs_dense(paths: &[String]) {
             p.x, p.y, p.z, p.nx, p.ny, p.nz, p.r, p.g, p.b
         ));
     }
-    fs::write("dense.ply", &ply).unwrap();
+    fs::write(out.dense_ply(), &ply).unwrap();
     println!(
         "Dense: {}→{} pts → dense.ply ({:.1} KB)",
         all_pts.len(),

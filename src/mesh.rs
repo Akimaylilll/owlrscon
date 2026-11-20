@@ -64,6 +64,8 @@ pub struct DsmOptions {
     pub max_side: usize,
     /// 足迹膨胀轮数：闭合点云覆盖中的小孔洞并给边界留一圈余量。
     pub fill_radius: usize,
+    /// 每格最少点数：低于此数的格视为不可靠、留空由扩散填平。稀疏点云（SfM 点）应设 1。
+    pub min_pts: u32,
 }
 
 impl Default for DsmOptions {
@@ -71,6 +73,7 @@ impl Default for DsmOptions {
         Self {
             max_side: DSM_MAX_SIDE,
             fill_radius: DSM_FILL_RADIUS,
+            min_pts: DSM_MIN_PTS,
         }
     }
 }
@@ -322,6 +325,156 @@ fn dsm_median_filter(hgt: &mut [f64], nx: usize, ny: usize, k: usize, passes: us
     }
 }
 
+/// 建筑 footprint + 屋顶高度（用于在稀疏 DTM 上把房区抬升回屋顶）。
+pub(crate) struct Building {
+    pub(crate) xmin: f64,
+    pub(crate) xmax: f64,
+    pub(crate) ymin: f64,
+    pub(crate) ymax: f64,
+    pub(crate) roof: f64,
+}
+
+/// 从稀疏点云检测建筑：2D 格内 z 跨度大（垂直墙）+ 4 连通聚类 + 过滤。
+/// 地形是缓坡（格内 z 跨度小），建筑墙是垂直的（格内 z 跨度大），据此分离。
+pub(crate) fn detect_buildings(points: &[(f64, f64, f64)]) -> Vec<Building> {
+    let n = points.len();
+    if n < 100 {
+        return Vec::new();
+    }
+    let (mut xmin, mut xmax, mut ymin, mut ymax) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    let mut zs: Vec<f64> = Vec::new();
+    for &(x, y, z) in points {
+        xmin = xmin.min(x);
+        xmax = xmax.max(x);
+        ymin = ymin.min(y);
+        ymax = ymax.max(y);
+        zs.push(z);
+    }
+    let extx = xmax - xmin;
+    let exty = ymax - ymin;
+    let max_ext = extx.max(exty);
+    if max_ext <= 1e-9 {
+        return Vec::new();
+    }
+    zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let z_lo = zs[(n as f64 * 0.02) as usize];
+    let z_hi = zs[(n as f64 * 0.98) as usize];
+    let z_range = (z_hi - z_lo).max(1e-3);
+    // 墙 z 跨度阈值：相对场景 z 范围（地形格内 z 跨度远小于此）
+    let wall_thresh = (z_range * 0.15).max(0.03);
+
+    let cell = (max_ext / 100.0).max(0.01);
+    let nx = ((extx / cell).ceil() as usize).max(2) + 1;
+    let ny = ((exty / cell).ceil() as usize).max(2) + 1;
+    let mut grid_zs: Vec<Vec<f64>> = vec![Vec::new(); nx * ny];
+    for &(x, y, z) in points {
+        let i = ((x - xmin) / cell).floor() as isize;
+        let j = ((y - ymin) / cell).floor() as isize;
+        if i < 0 || j < 0 {
+            continue;
+        }
+        let i = (i as usize).min(nx - 1);
+        let j = (j as usize).min(ny - 1);
+        grid_zs[j * nx + i].push(z);
+    }
+    let mut wall = vec![false; nx * ny];
+    for (k, g) in grid_zs.iter().enumerate() {
+        if g.len() >= 3 {
+            let (mut mn, mut mx) = (f64::MAX, f64::MIN);
+            for &z in g {
+                mn = mn.min(z);
+                mx = mx.max(z);
+            }
+            if mx - mn > wall_thresh {
+                wall[k] = true;
+            }
+        }
+    }
+    // 4 连通聚类
+    let mut label = vec![usize::MAX; nx * ny];
+    let mut comps: Vec<Vec<usize>> = Vec::new();
+    for j in 0..ny {
+        for i in 0..nx {
+            let k = j * nx + i;
+            if !wall[k] || label[k] != usize::MAX {
+                continue;
+            }
+            let cid = comps.len();
+            comps.push(Vec::new());
+            let mut stack = vec![(i, j)];
+            label[k] = cid;
+            while let Some((ci, cj)) = stack.pop() {
+                comps[cid].push(cj * nx + ci);
+                for (di, dj) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)] {
+                    let ni = ci as i64 + di;
+                    let nj = cj as i64 + dj;
+                    if ni < 0 || nj < 0 || ni >= nx as i64 || nj >= ny as i64 {
+                        continue;
+                    }
+                    let nk = nj as usize * nx + ni as usize;
+                    if wall[nk] && label[nk] == usize::MAX {
+                        label[nk] = cid;
+                        stack.push((ni as usize, nj as usize));
+                    }
+                }
+            }
+        }
+    }
+    let margin = cell * 2.0;
+    let mut buildings: Vec<Building> = Vec::new();
+    for comp in &comps {
+        if comp.len() < 4 {
+            continue;
+        }
+        let (mut bxmin, mut bxmax, mut bymin, mut bymax) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        let mut rzs: Vec<f64> = Vec::new();
+        for &k in comp {
+            let i = k % nx;
+            let j = k / nx;
+            let cx = xmin + i as f64 * cell;
+            let cy = ymin + j as f64 * cell;
+            bxmin = bxmin.min(cx);
+            bxmax = bxmax.max(cx + cell);
+            bymin = bymin.min(cy);
+            bymax = bymax.max(cy + cell);
+            rzs.extend(grid_zs[k].iter().copied());
+        }
+        rzs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let roof = rzs[(rzs.len() as f64 * 0.9) as usize];
+        buildings.push(Building {
+            xmin: bxmin - margin,
+            xmax: bxmax + margin,
+            ymin: bymin - margin,
+            ymax: bymax + margin,
+            roof,
+        });
+    }
+    // 合并重叠 bbox（>30% 面积重叠）
+    let mut merged: Vec<Building> = Vec::new();
+    for b in buildings {
+        let mut found = false;
+        for m in merged.iter_mut() {
+            let ox = (b.xmax.min(m.xmax) - b.xmin.max(m.xmin)).max(0.0);
+            let oy = (b.ymax.min(m.ymax) - b.ymin.max(m.ymin)).max(0.0);
+            let area_b = (b.xmax - b.xmin) * (b.ymax - b.ymin);
+            let area_m = (m.xmax - m.xmin) * (m.ymax - m.ymin);
+            if ox * oy > 0.3 * area_b.min(area_m) {
+                m.xmin = m.xmin.min(b.xmin);
+                m.xmax = m.xmax.max(b.xmax);
+                m.ymin = m.ymin.min(b.ymin);
+                m.ymax = m.ymax.max(b.ymax);
+                m.roof = m.roof.max(b.roof);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            merged.push(b);
+        }
+    }
+    merged
+}
+
 /// 高度场（DSM）重建：把点云当作 2.5D 地形表面重建。
 ///
 /// 不依赖法向、不做隐式场，而是直接在 (x,y) 网格上重建表面高度。对航拍地形这种
@@ -391,7 +544,7 @@ pub fn build_mesh_dsm(
     // 每格中位数高度（稳健）；点数不足的格视为不可靠 → 留空，随后由邻域扩散填平。
     let mut hgt = vec![f64::NEG_INFINITY; total];
     for k in 0..total {
-        if cnt[k] >= DSM_MIN_PTS {
+        if cnt[k] >= opts.min_pts {
             let zv = &mut zs[k];
             zv.sort_by(|a, b| a.partial_cmp(b).unwrap());
             hgt[k] = zv[zv.len() / 2];
@@ -399,7 +552,7 @@ pub fn build_mesh_dsm(
     }
     drop(zs);
     // 足迹 = 可靠格点（点数达阈值的格）。
-    let mut foot: Vec<bool> = cnt.iter().map(|&c| c >= DSM_MIN_PTS).collect();
+    let mut foot: Vec<bool> = cnt.iter().map(|&c| c >= opts.min_pts).collect();
 
     // ---- 3) 足迹膨胀（闭合小孔洞 + 边界留边） ----
     for _ in 0..opts.fill_radius {

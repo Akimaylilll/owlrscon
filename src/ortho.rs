@@ -27,6 +27,7 @@ const GAIN_MIN: f64 = 0.5;
 const GAIN_MAX: f64 = 2.0;
 /// 输出总像素上限：超出自适应放宽 GSD，保护内存（4G 下限）。
 const MAX_ORTHO_PX: u64 = 64_000_000;
+#[allow(dead_code)]
 const OUT_PREFIX: &str = "ortho";
 
 /// 纹理贴图用的相机：世界→相机位姿 + 全分辨率内参 + 原图路径。
@@ -52,8 +53,8 @@ fn project(c: &Cam, p: &Vector3<f64>) -> (f64, f64, f64) {
 }
 
 /// 从 camera_poses.json 加载相机（与 mvs.rs / texture.rs 一致：f 逐相机、cx/cy 取 poses[0]）。
-fn load_cams(paths: &[String]) -> Result<Vec<Cam>, String> {
-    let s = fs::read_to_string("camera_poses.json").map_err(|e| format!("camera_poses.json: {e}"))?;
+fn load_cams(paths: &[String], poses_path: &str) -> Result<Vec<Cam>, String> {
+    let s = fs::read_to_string(poses_path).map_err(|e| format!("camera_poses.json: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| e.to_string())?;
     let poses = v["poses"].as_array().ok_or("no poses array")?;
     if poses.len() < 2 {
@@ -112,9 +113,9 @@ fn load_cams(paths: &[String]) -> Result<Vec<Cam>, String> {
 }
 
 /// 只读深度图缓存的 depth(n) 与 cost(第 4n 个 f32 起 n 个)，跳过法向，节省内存。
-fn read_depth_cost(si: usize, n: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+fn read_depth_cost(si: usize, n: usize, dm_dir: &str) -> Option<(Vec<f32>, Vec<f32>)> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = fs::File::open(format!("{}/{}.bin", crate::types::MVS_DM_DIR, si)).ok()?;
+    let mut f = fs::File::open(format!("{}/{}.bin", dm_dir, si)).ok()?;
     let mut dbuf = vec![0u8; n * 4];
     f.read_exact(&mut dbuf).ok()?;
     f.seek(SeekFrom::Start((4 * n * 4) as u64)).ok()?;
@@ -455,22 +456,22 @@ fn write_geotiff(path: &str, w: u32, h: u32, gsd: f64, x0: f64, y0: f64, rgb: &[
 }
 
 /// 正射影像独立入口：读 mesh.obj + camera_poses.json + 原图 + 深度图，写 `ortho.tif`。
-pub fn run_ortho(paths: &[String]) {
-    let Some((verts, tris)) = load_mesh_obj("mesh.obj") else {
+pub fn run_ortho(paths: &[String], out: &crate::types::Paths) {
+    let Some((verts, tris)) = load_mesh_obj(&out.mesh_obj()) else {
         eprintln!("  [ortho] mesh.obj 不存在或为空，请先跑 -stage=mesh 生成网格");
         return;
     };
-    let cams = match load_cams(paths) {
+    let cams = match load_cams(paths, &out.camera_poses_json()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("  [ortho] 无法加载相机: {e}，跳过正射影像");
             return;
         }
     };
-    generate_ortho(&cams, &verts, &tris);
+    generate_ortho(&cams, &verts, &tris, out);
 }
 
-fn generate_ortho(cams: &[Cam], verts: &[Vector3<f64>], tris: &[[usize; 3]]) {
+fn generate_ortho(cams: &[Cam], verts: &[Vector3<f64>], tris: &[[usize; 3]], out: &crate::types::Paths) {
     let nc = cams.len();
     if verts.is_empty() || tris.is_empty() {
         println!("  [ortho] 空网格，跳过");
@@ -491,6 +492,24 @@ fn generate_ortho(cams: &[Cam], verts: &[Vector3<f64>], tris: &[[usize; 3]]) {
         center += v;
     }
     center /= verts.len() as f64;
+
+    // 约束正射范围到相机中心包围盒（多视角覆盖区），包围盒外的网格顶点不纳入 extent。
+    {
+        let (mut cxmin, mut cxmax, mut cymin, mut cymax) =
+            (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+        for c in cams {
+            cxmin = cxmin.min(c.center.x);
+            cxmax = cxmax.max(c.center.x);
+            cymin = cymin.min(c.center.y);
+            cymax = cymax.max(c.center.y);
+        }
+        if cxmin <= cxmax && cymin <= cymax {
+            xmin = xmin.max(cxmin);
+            xmax = xmax.min(cxmax);
+            ymin = ymin.max(cymin);
+            ymax = ymax.min(cymax);
+        }
+    }
 
     // GSD：逐相机在场景中心处的像素尺度 d/f，取中位数（≈ 原始图像分辨率）。
     let mut gsds: Vec<f64> = Vec::with_capacity(nc);
@@ -592,7 +611,7 @@ fn generate_ortho(cams: &[Cam], verts: &[Vector3<f64>], tris: &[[usize; 3]]) {
             continue;
         };
         let n = (cam.w as usize) * (cam.h as usize);
-        let Some((depth, cost)) = read_depth_cost(ci, n) else {
+        let Some((depth, cost)) = read_depth_cost(ci, n, &out.mvs_dm_dir()) else {
             c_no_depth += 1;
             continue;
         };
@@ -687,7 +706,7 @@ fn generate_ortho(cams: &[Cam], verts: &[Vector3<f64>], tris: &[[usize; 3]]) {
         .count();
     println!("  colored: {} / {} px", colored, w * h);
 
-    let tif = format!("{}.tif", OUT_PREFIX);
+    let tif = out.ortho_tif();
     match write_geotiff(&tif, w as u32, h as u32, gsd, x0, y0, &rgb) {
         Ok(()) => println!(
             "  wrote {} ({:.1} MB, extent {:.1}x{:.1} m)",
@@ -699,7 +718,7 @@ fn generate_ortho(cams: &[Cam], verts: &[Vector3<f64>], tris: &[[usize; 3]]) {
         Err(e) => eprintln!("  [ortho] 写 GeoTIFF 失败: {e}"),
     }
 
-    let png = format!("{}_preview.png", OUT_PREFIX);
+    let png = out.ortho_preview_png();
     if let Some(img) = RgbImage::from_raw(w as u32, h as u32, rgb) {
         if let Ok(mut f) = fs::File::create(&png) {
             let _ = DynamicImage::ImageRgb8(img).write_to(&mut f, ImageFormat::Png);

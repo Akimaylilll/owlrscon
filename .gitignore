@@ -1,6 +1,6 @@
 /target
 /images
-/cache
+/out
 *.ply
 *.obj
 *.json

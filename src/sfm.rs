@@ -31,16 +31,44 @@ const INIT_NUM_TRIALS: usize = 3;
 const MAX_REG_TRIALS: usize = 3;
 const MAX_MODEL_OVERLAP: usize = 20;
 
+// 选图时的序列邻近权重：grow 优先注册「离最近一张图 index 最近」的图（同航线前向延续），
+// 避免被重复纹理/高纹理的跨航线图顶到队首、把航线间距拼乱。对蛇形航线，同航线图 index 相邻，
+// 跨航线图 index 差 ~45-60；该权重让前向图（|Δindex|≈1）稳定压过跨航线图（|Δindex|≈60）。
+const SEQ_PROXIMITY_WEIGHT: f64 = 50.0;
+
 // 多子模型重建：图像对匹配数达到该阈值才作为子模型种子
 const SUB_MODEL_MIN_MATCHES: usize = 50;
 
 // 子模型合并：无共享相机、仅靠薄接缝共享 track 时，可接受的最小内点数。
-// 薄接缝的真实对应点本来就少（重复纹理污染 + 独立重建漂移），20 太苛刻，
-// 10 个内点已足以约束平面场景的相似变换。
+// 跨线（180° 转向、相邻航线只在掉头处重叠）真对应点本就不多，但 3 个内点
+// 会让 1~2 条假 track 就通过门槛，把航线在错误的相对位姿下拼起来（实测
+// 13 条航线被拼乱、整体塌缩到 ~1/10 尺度）。10 个内点是安全下限。
 const MIN_MERGE_SHARED_TRACKS: usize = 10;
+
+// 纯 track（无共享相机）合并时，至少需要这么多共享 track 才尝试对齐。
+// （当前循环式合并用 collect_merge_anchors 的 bn<4 门槛，此常量仅作参考保留。）
+#[allow(dead_code)]
+const MIN_TRACK_ONLY_ALIGN: usize = 4;
+
+// Sim3 合并的尺度范围保护：子模型尺度任意（无 GPS），但不应极端。
+const MERGE_SCALE_MIN: f64 = 0.1;
+const MERGE_SCALE_MAX: f64 = 10.0;
 
 // 增量注册时，每注册 N 张图才做一次全局 BA（局部 BA 每张都做），加速重建
 const GLOBAL_BA_EVERY: usize = 5;
+// 诊断开关：置 true 关闭 grow 阶段的全局 BA（含每 N 张与 grow 结束），只剩 local BA + PnP，
+// 用来判断航线被拼乱是全局 BA 导致的还是注册本身导致的。定位后再改回 false。
+const DISABLE_GLOBAL_BA_DIAG: bool = false;
+
+// 每个子模型最多额外注册多少张图（不含种子 2 张）。航线每条约 7~8 张，设为 6 让每个
+// 子模型严格只覆盖一条航线（2+6=8 张），跨航线对齐全部交给 merge（用全部跨航线匹配 +
+// RANSAC，比增量 PnP 更鲁棒）。这是多子模型思路的关键：限制单个子模型的规模，避免
+// 一条增量链跨多条航线累积漂移。
+const MAX_GROW_IMAGES: usize = 6;
+
+// 调平开关：合并前把每个子模型的相机视向（R^T e_z）对齐到共同参考。对陡坡地形这会
+// 把山坡起伏一起转掉、压扁 z（实测 z 从 94m 压到 40m），先置 false 验证 z 是否恢复。
+const ENABLE_LEVELING: bool = false;
 
 const ABS_POSE_MIN_NUM_INLIERS: usize = 30;
 const ABS_POSE_MAX_ERROR_PX: f64 = 12.0;
@@ -54,18 +82,20 @@ const COMPLETE_MAX_REPROJ_ERROR_PX: f64 = 4.0;
 const FILTER_MAX_REPROJ_ERROR_PX: f64 = 4.0;
 const FILTER_MIN_TRI_ANGLE_DEG: f64 = 1.5;
 
-const MAX_REFINEMENTS: usize = 5;
+const MAX_REFINEMENTS: usize = 8;
 const MAX_REFINEMENT_CHANGE: f64 = 0.01;
 
 const BA_LOCAL_NUM_IMAGES: usize = 6;
 const BA_LOCAL_MAX_ITERATIONS: usize = 25;
-const BA_GLOBAL_MAX_ITERATIONS: usize = 50;
+const BA_GLOBAL_MAX_ITERATIONS: usize = 400;
 
 const MIN_FOCAL_LENGTH_RATIO: f64 = 0.1;
 const MAX_FOCAL_LENGTH_RATIO: f64 = 10.0;
 
 pub(crate) const RANSAC_ITERATIONS: usize = 2000;
-pub(crate) const RANSAC_THRESHOLD_PX: f64 = 4.0;
+// 实验：放宽几何过滤阈值（4→8px），观察北部重复纹理区的匹配是否变多、稀疏点是否变均衡。
+// 若有效，再按区域自适应细化；若无效则说明是重复纹理假匹配的硬天花板。
+pub(crate) const RANSAC_THRESHOLD_PX: f64 = 8.0;
 
 // ---------------------------------------------------------------------
 //  Core types
@@ -312,6 +342,136 @@ fn read_exif_focal_length(data: &[u8]) -> Option<f64> {
 /// 35mm 等效焦距，EXIF 0xA405。
 fn read_exif_focal_length_35mm(data: &[u8]) -> Option<f64> {
     read_exif_focal_tag(data, 0xA405)
+}
+
+/// 读取 EXIF GPS（纬度/经度/海拔），返回 `(lat_deg, lon_deg, alt_m)`。无 GPS 时返回 `None`。
+/// 解析 GPS IFD（EXIF 0x8825 指向），读 GPSLatitude(0x0002)/GPSLongitude(0x0004)（3 个
+/// RATIONAL：度/分/秒）与 GPSAltitude(0x0006)，并处理 N/S、E/W 符号。
+/// 当前未启用（用户要求不依赖 GPS），保留供可选米制对齐参考。
+#[allow(dead_code)]
+fn read_exif_gps(data: &[u8]) -> Option<(f64, f64, f64)> {
+    let mut pos = 0;
+    while pos + 4 < data.len() {
+        if data[pos] == 0xFF && data[pos + 1] == 0xE1 {
+            break;
+        }
+        pos += 1;
+    }
+    if pos + 10 > data.len() {
+        return None;
+    }
+    let app1_len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
+    if pos + 2 + app1_len > data.len() {
+        return None;
+    }
+    let exif_start = pos + 4;
+    if &data[exif_start..exif_start + 6] != b"Exif\x00\x00" {
+        return None;
+    }
+    let tiff = exif_start + 6;
+    if tiff + 8 > data.len() {
+        return None;
+    }
+    let le = &data[tiff..tiff + 2] == b"\x49\x49";
+    let read_u16 = |p: usize| -> u16 {
+        if le {
+            data[p] as u16 | ((data[p + 1] as u16) << 8)
+        } else {
+            ((data[p] as u16) << 8) | data[p + 1] as u16
+        }
+    };
+    let read_u32 = |p: usize| -> u32 {
+        if le {
+            (data[p] as u32)
+                | ((data[p + 1] as u32) << 8)
+                | ((data[p + 2] as u32) << 16)
+                | ((data[p + 3] as u32) << 24)
+        } else {
+            ((data[p] as u32) << 24)
+                | ((data[p + 1] as u32) << 16)
+                | ((data[p + 2] as u32) << 8)
+                | (data[p + 3] as u32)
+        }
+    };
+
+    let ifd0 = tiff + read_u32(tiff + 4) as usize;
+    let n0 = read_u16(ifd0) as usize;
+    let mut gps_ifd = None;
+    let mut ep = ifd0 + 2;
+    for _ in 0..n0.min(200) {
+        if ep + 12 > data.len() {
+            break;
+        }
+        if read_u16(ep) == 0x8825 {
+            gps_ifd = Some(tiff + read_u32(ep + 8) as usize);
+            break;
+        }
+        ep += 12;
+    }
+    let gps = gps_ifd?;
+    if gps + 2 > data.len() {
+        return None;
+    }
+
+    let read_rat = |p: usize| -> f64 {
+        let num = read_u32(p) as f64;
+        let den = read_u32(p + 4) as f64;
+        if den > 0.0 {
+            num / den
+        } else {
+            0.0
+        }
+    };
+
+    let n = read_u16(gps) as usize;
+    let mut lat: Option<f64> = None;
+    let mut lon: Option<f64> = None;
+    let mut alt: Option<f64> = None;
+    let mut lat_ref = b'N';
+    let mut lon_ref = b'E';
+    let mut ep = gps + 2;
+    for _ in 0..n.min(64) {
+        if ep + 12 > data.len() {
+            break;
+        }
+        let tag = read_u16(ep);
+        let typ = read_u16(ep + 2);
+        let count = read_u32(ep + 4);
+        match tag {
+            0x0001 => lat_ref = data[ep + 8],
+            0x0003 => lon_ref = data[ep + 8],
+            0x0002 if typ == 5 && count >= 3 => {
+                let vp = tiff + read_u32(ep + 8) as usize;
+                if vp + 24 <= data.len() {
+                    lat = Some(read_rat(vp) + read_rat(vp + 8) / 60.0 + read_rat(vp + 16) / 3600.0);
+                }
+            }
+            0x0004 if typ == 5 && count >= 3 => {
+                let vp = tiff + read_u32(ep + 8) as usize;
+                if vp + 24 <= data.len() {
+                    lon = Some(read_rat(vp) + read_rat(vp + 8) / 60.0 + read_rat(vp + 16) / 3600.0);
+                }
+            }
+            0x0006 if typ == 5 && count >= 1 => {
+                let vp = tiff + read_u32(ep + 8) as usize;
+                if vp + 8 <= data.len() {
+                    alt = Some(read_rat(vp));
+                }
+            }
+            _ => {}
+        }
+        ep += 12;
+    }
+
+    let mut lat = lat?;
+    let mut lon = lon?;
+    if lat_ref == b'S' {
+        lat = -lat;
+    }
+    if lon_ref == b'W' {
+        lon = -lon;
+    }
+    Some((lat, lon, alt.unwrap_or(0.0)))
 }
 
 fn img_file_stem(path: &str) -> String {
@@ -1251,6 +1411,7 @@ impl Sfm {
         };
         let corrs = index.get(&key)?;
         if corrs.len() < min_num_inliers {
+            println!("    [seed] ({},{}) reject: {} matches < {}", first, second, corrs.len(), min_num_inliers);
             return None;
         }
 
@@ -1265,16 +1426,24 @@ impl Sfm {
             pts2.push(Vector3::new(kpb.x as f64, kpb.y as f64, 1.0));
         }
 
-        let g = estimate_two_view_geometry(&pts1, &pts2, &self.intrinsics, min_num_inliers)?;
+        let g = match estimate_two_view_geometry(&pts1, &pts2, &self.intrinsics, min_num_inliers) {
+            Some(g) => g,
+            None => {
+                println!("    [seed] ({},{}) reject: two-view geometry failed", first, second);
+                return None;
+            }
+        };
         if g.inliers.len() < min_num_inliers {
+            println!("    [seed] ({},{}) reject: F inliers {} < {}", first, second, g.inliers.len(), min_num_inliers);
             return None;
         }
-        if g.cam2_from_cam1.t.z.abs() / g.cam2_from_cam1.t.norm().max(1e-12)
-            > INIT_MAX_FORWARD_MOTION
-        {
+        let fwd = g.cam2_from_cam1.t.z.abs() / g.cam2_from_cam1.t.norm().max(1e-12);
+        if fwd > INIT_MAX_FORWARD_MOTION {
+            println!("    [seed] ({},{}) reject: forward motion {:.2} > {}", first, second, fwd, INIT_MAX_FORWARD_MOTION);
             return None;
         }
         if g.tri_angle < min_tri_angle {
+            println!("    [seed] ({},{}) reject: tri angle {:.2}° < {:.2}°", first, second, g.tri_angle.to_degrees(), min_tri_angle.to_degrees());
             return None;
         }
         Some(g)
@@ -1340,6 +1509,16 @@ impl Sfm {
 
         self.triangulate_image(first, tracks, features, index);
         self.triangulate_image(second, tracks, features, index);
+        let after_tri = self
+            .points
+            .iter()
+            .filter(|p| p.track_id != usize::MAX)
+            .count();
+
+        // 两视图位姿是可信的（recover_pose 已过 cheirality）。下面的初始对 BA 有尺度 gauge，
+        // 对前向航线的种子对（如 16,17）会塌缩到 baseline=0 → 点全错 → filter 全删。
+        // 保存 BA 前的第二相机位姿，若 BA 塌缩就回退重三角化。
+        let cam_second_pre = self.cameras[second].clone();
 
         self.adjust_global_bundle_fixed(
             tracks,
@@ -1348,9 +1527,93 @@ impl Sfm {
             BA_GLOBAL_MAX_ITERATIONS,
             Some(first),
         );
-        self.normalize();
-        self.filter_points3d(tracks, features);
+        let after_ba = self
+            .points
+            .iter()
+            .filter(|p| p.track_id != usize::MAX)
+            .count();
+
+        // 注意：不再做 L1 归一化。L1 归一化会把每个子模型按「各自点分布的平均半径」缩放到
+        // 单位尺度，导致不同子模型尺度不一致（实测相差 0.6~1.7 倍），刚体 merge（scale=1）
+        // 因此对不上（robust_sim3 全部 "no rigid consensus"）。所有子模型用同一相机、同一
+        // 焦距，本质矩阵给出的单位基线尺度本就一致，直接保留这个一致尺度即可。
+        // self.normalize();
+        // BA 塌缩检测：若第二相机中心与第一相机中心重合（baseline→0），说明初始对 BA
+        // 掉进了尺度 gauge 的退化解，回退到两视图位姿并重三角化。
+        {
+            let c0 = camera_center(
+                &self.cameras[first].as_ref().unwrap().r,
+                &self.cameras[first].as_ref().unwrap().t,
+            );
+            let c1 = camera_center(
+                &self.cameras[second].as_ref().unwrap().r,
+                &self.cameras[second].as_ref().unwrap().t,
+            );
+            let baseline = (c1 - c0).norm();
+            if baseline < 1e-4 {
+                println!(
+                    "    [seed] ({},{}) BA collapsed baseline={:.6}, reverting to two-view pose",
+                    first, second, baseline
+                );
+                self.cameras[second] = cam_second_pre;
+                self.points.clear();
+                self.rebuild_track_to_point();
+                self.triangulate_image(first, tracks, features, index);
+                self.triangulate_image(second, tracks, features, index);
+                // 保持与主路径一致：不做 L1 归一化（见上方注释），维持本质矩阵的一致尺度。
+            }
+        }
+        // 诊断：过滤前统计初始对位姿/重投影/角度，定位 filter 全删点（16,17 被全删、37,69 只删 33）的原因
+        {
+            let cx = self.cx();
+            let cy = self.cy();
+            let c0 = camera_center(
+                &self.cameras[first].as_ref().unwrap().r,
+                &self.cameras[first].as_ref().unwrap().t,
+            );
+            let c1 = camera_center(
+                &self.cameras[second].as_ref().unwrap().r,
+                &self.cameras[second].as_ref().unwrap().t,
+            );
+            let baseline = (c1 - c0).norm();
+            let mut errs: Vec<f64> = Vec::new();
+            let mut angs: Vec<f64> = Vec::new();
+            for p in self.points.iter().filter(|p| p.track_id != usize::MAX) {
+                let track = &tracks[p.track_id];
+                let mut best_e = f64::INFINITY;
+                for &(im, kp) in &track.observations {
+                    if let Some(cam) = self.cameras[im].as_ref() {
+                        if let Some((u, v, _)) =
+                            project_point(&cam.r, &cam.t, &p.xyz, self.focals[im], cx, cy)
+                        {
+                            let kd = &features[im].keypoints[kp];
+                            let e = ((u - kd.x as f64).powi(2) + (v - kd.y as f64).powi(2)).sqrt();
+                            best_e = best_e.min(e);
+                        }
+                    }
+                }
+                if best_e.is_finite() {
+                    errs.push(best_e);
+                }
+                let v0 = (p.xyz - c0).normalize();
+                let v1 = (p.xyz - c1).normalize();
+                angs.push(v0.dot(&v1).clamp(-1.0, 1.0).acos().to_degrees());
+            }
+            errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            angs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med_e = if errs.is_empty() { -1.0 } else { errs[errs.len() / 2] };
+            let med_a = if angs.is_empty() { -1.0 } else { angs[angs.len() / 2] };
+            println!(
+                "    [seed] ({},{}) pre-filter: baseline={:.4} med_reproj={:.2}px med_angle={:.2}deg",
+                first, second, baseline, med_e, med_a
+            );
+        }
+        let removed = self.filter_points3d(tracks, features);
         self.filter_frames(tracks);
+        println!(
+            "    [seed] ({},{}) tri={} pts, after_ba={}, filter_removed={}",
+            first, second, after_tri, after_ba, removed
+        );
 
         if self.num_registered() > 0
             && self
@@ -1371,6 +1634,15 @@ impl Sfm {
             );
             SfmStatus::Success
         } else {
+            let np = self.points.iter().filter(|p| p.track_id != usize::MAX).count();
+            println!(
+                "    [seed] ({},{}) reject: init produced {} points (< {}), {} registered",
+                first,
+                second,
+                np,
+                ABS_POSE_MIN_NUM_INLIERS,
+                self.num_registered()
+            );
             self.cameras[first] = None;
             self.cameras[second] = None;
             self.points.clear();
@@ -1382,7 +1654,12 @@ impl Sfm {
     // -----------------------------------------------------------------
     //  Next image selection
     // -----------------------------------------------------------------
-    fn find_next_images(&self, tracks: &[Track], features: &[ImageFeatures]) -> Vec<usize> {
+    fn find_next_images(
+        &self,
+        tracks: &[Track],
+        features: &[ImageFeatures],
+        last_img: Option<usize>,
+    ) -> Vec<usize> {
         let mut scored: Vec<(f64, usize)> = (0..self.num_images)
             .into_par_iter()
             .filter(|&img| {
@@ -1417,7 +1694,12 @@ impl Sfm {
                     }
                 };
                 let penalty = if self.reg_trials[img] > 0 { 1e6 } else { 0.0 };
-                Some((score - penalty, img))
+                // 序列邻近软惩罚：优先同航线前向延续（index 相邻），其次最近的相邻航线。
+                let seq_penalty = match last_img {
+                    Some(last) => (img as i64 - last as i64).abs() as f64 * SEQ_PROXIMITY_WEIGHT,
+                    None => 0.0,
+                };
+                Some((score - penalty - seq_penalty, img))
             })
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -2510,13 +2792,15 @@ fn grow_sub_model(
     let mut reg_count = 0usize;
     loop {
         let mut success = false;
-        let mut last_img = None;
+        // 从已注册图里取 index 最大的作为「前沿」（种子对通常是连续两张，取第二张），
+        // 这样首次选图就能用序列邻近惩罚优先同航线前向延续，而不是跳去跨航线图。
+        let mut last_img = (0..sfm.num_images).rev().find(|&i| sfm.cameras[i].is_some());
 
         for structure_less in [false, true] {
             let next = if structure_less {
                 sfm.structure_less_candidates(index)
             } else {
-                sfm.find_next_images(tracks, features)
+                sfm.find_next_images(tracks, features, last_img)
             };
             for img in next {
                 let ok = if structure_less {
@@ -2540,8 +2824,28 @@ fn grow_sub_model(
             sfm.triangulate_image(img, tracks, features, index);
             sfm.iterative_refinement(tracks, features, false, Some(img));
             reg_count += 1;
-            if reg_count % GLOBAL_BA_EVERY == 0 {
+            if reg_count % GLOBAL_BA_EVERY == 0 && !DISABLE_GLOBAL_BA_DIAG {
                 sfm.iterative_refinement(tracks, features, true, None);
+                // 诊断：打印全局 BA 后相机中心 bbox，观察尺度/结构在 grow 过程中从哪一步开始塌
+                let mut lo = Vector3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+                let mut hi = Vector3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for cam in sfm.cameras.iter().flatten() {
+                    let c = camera_center(&cam.r, &cam.t);
+                    lo.x = lo.x.min(c.x); lo.y = lo.y.min(c.y); lo.z = lo.z.min(c.z);
+                    hi.x = hi.x.max(c.x); hi.y = hi.y.max(c.y); hi.z = hi.z.max(c.z);
+                }
+                println!(
+                    "    [grow-bbox] after {} reg: x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}]",
+                    reg_count, lo.x, hi.x, lo.y, hi.y, lo.z, hi.z
+                );
+            }
+            if reg_count >= MAX_GROW_IMAGES {
+                println!(
+                    "  grow stopped at MAX_GROW_IMAGES={} (sub-model {} images)",
+                    MAX_GROW_IMAGES,
+                    sfm.num_registered()
+                );
+                break;
             }
             let registered = sfm.num_registered();
             println!(
@@ -2589,7 +2893,9 @@ fn grow_sub_model(
     }
 
     // 结束前做一次全局 BA 优化
-    sfm.iterative_refinement(tracks, features, true, None);
+    if !DISABLE_GLOBAL_BA_DIAG {
+        sfm.iterative_refinement(tracks, features, true, None);
+    }
     sfm.update_point_errors(tracks, features);
 }
 
@@ -2720,6 +3026,31 @@ fn umeyama_rigid(
     Some((rot, trans))
 }
 
+/// 返回把单位向量 `a` 旋转到 `b` 的最短旋转矩阵（绕 a×b 轴，Rodrigues）。
+/// 用于「调平」：把各子模型的平均相机视向（上方向）对齐到共同参考。
+fn rotation_between(a: &Vector3<f64>, b: &Vector3<f64>) -> Matrix3<f64> {
+    let a = a.normalize();
+    let b = b.normalize();
+    let c = a.dot(&b).clamp(-1.0, 1.0);
+    if c > 0.999_999 {
+        return Matrix3::identity();
+    }
+    if c < -0.999_999 {
+        let axis = if a.x.abs() < 0.9 { Vector3::x() } else { Vector3::y() };
+        let axis = a.cross(&axis).normalize();
+        return so3_exp(&(axis * std::f64::consts::PI));
+    }
+    let v = a.cross(&b);
+    let s = v.norm();
+    // Rodrigues：R = I + skew(v) + skew(v)^2 * (1-c)/s^2，其中 skew(v) = sinθ·K（单位轴斜对称）。
+    let vx = Matrix3::new(
+        0.0, -v.z, v.y,
+        v.z, 0.0, -v.x,
+        -v.y, v.x, 0.0,
+    );
+    Matrix3::identity() + vx + vx * vx * ((1.0 - c) / (s * s))
+}
+
 /// 鲁棒相似变换：用 RANSAC 剔除离群共享点后求 `dst ≈ scale * rot * src + trans`。
 ///
 /// `scale_prior` 用于无共享相机、仅靠薄接缝共享 track 的合并：薄接缝上自由拟合的
@@ -2824,7 +3155,7 @@ fn robust_sim3(
             None => continue,
         };
         // scale 合理性保护：子模型都是同一相机的度量重建，scale 不应极端
-        if !(1e-2..=1e2).contains(&scale) {
+        if !(MERGE_SCALE_MIN..=MERGE_SCALE_MAX).contains(&scale) {
             continue;
         }
         let mut inliers = Vec::new();
@@ -2878,7 +3209,7 @@ fn robust_sim3(
             return None;
         }
     };
-    if !(1e-2..=1e2).contains(&s) {
+    if !(MERGE_SCALE_MIN..=MERGE_SCALE_MAX).contains(&s) {
         println!(
             "    robust_sim3: n={} direct-LS scale={:.3} out of range",
             n, s
@@ -2909,6 +3240,8 @@ fn submodel_point_count(s: &Sfm) -> usize {
 /// 子模型场景尺度：有效点到质心的均方根距离。
 /// 两个子模型都在 `initialize_with_pair` 做过 L1 归一化，因此各自场景尺度应接近；
 /// 两者之比是薄接缝合并时的可靠尺度先验（薄接缝自身无法可靠约束尺度）。
+/// 已停用（它是覆盖范围半径不是尺度，做尺度先验会给出错误缩放），保留供参考。
+#[allow(dead_code)]
 fn scene_spread(s: &Sfm) -> f64 {
     let pts: Vec<Vector3<f64>> = s
         .points
@@ -2993,94 +3326,182 @@ fn merge_submodel_into(
     }
 }
 
-/// 合并多个子模型：反复合并「共享锚点最多」的子模型对（而非固定以最大子模型为基准），
-/// 避免最大子模型恰好与其它子模型重叠不足时把整条链都丢弃。
-/// 共享相机中心位姿可靠，因此共享相机足够多的对可接受较少内点。
+/// 合并多个子模型：全局联合配准（姿态图）。
 fn merge_submodels(mut submodels: Vec<Sfm>) -> Sfm {
-    loop {
-        if submodels.len() <= 1 {
-            break;
+    let n = submodels.len();
+    if n <= 1 {
+        return submodels.into_iter().max_by_key(submodel_point_count).unwrap();
+    }
+
+    // ============ 0) 调平：把每个子模型的「上」方向对齐到共同参考 ============
+    // 各子模型坐标系由各自种子对决定，俯仰/滚转任意；农田近乎平面又约束不住这些角，导致
+    // 姿态图里 z 漂移。这里先按「相机平均视向」调平：R^T e_z（相机 +z 在世界里的方向）对
+    // 正视相机≈竖直向上，把所有子模型的这个方向对齐到共同参考，消除任意俯仰/滚转，让姿态
+    // 图只需对齐 yaw + 平移 + z。
+    if ENABLE_LEVELING {
+        let mut up_ref = Vector3::zeros();
+        let mut total = 0usize;
+        for s in &submodels {
+            for cam in s.cameras.iter().flatten() {
+                up_ref += cam.r.row(2).transpose();
+                total += 1;
+            }
         }
-        // 找共享锚点最多的一对 (bi, bj)
-        let mut bi = 0usize;
-        let mut bj = 1usize;
-        let mut bn = 0usize;
-        for i in 0..submodels.len() {
-            for j in (i + 1)..submodels.len() {
-                let (src, _, _) = collect_merge_anchors(&submodels[i], &submodels[j]);
-                if src.len() > bn {
-                    bn = src.len();
-                    bi = i;
-                    bj = j;
+        if total > 0 {
+            up_ref /= total as f64;
+            up_ref = up_ref.normalize();
+            for s in submodels.iter_mut() {
+                // 该子模型的上方向
+                let mut up_i = Vector3::zeros();
+                let mut cnt = 0usize;
+                for cam in s.cameras.iter().flatten() {
+                    up_i += cam.r.row(2).transpose();
+                    cnt += 1;
+                }
+                if cnt == 0 {
+                    continue;
+                }
+                up_i /= cnt as f64;
+                up_i = up_i.normalize();
+                // 调平旋转：把 up_i 转到 up_ref
+                let l = rotation_between(&up_i, &up_ref);
+                // 世界旋转 X' = L X；相机 R' = R L^T，t' = t
+                for cam in s.cameras.iter_mut().flatten() {
+                    cam.r = cam.r * l.transpose();
+                }
+                for p in s.points.iter_mut() {
+                    if p.track_id != usize::MAX {
+                        p.xyz = l * p.xyz;
+                    }
                 }
             }
         }
-        if bn < 4 {
-            break; // 没有任何一对有足够锚点
-        }
-
-        // 以点数较多者为基准，把另一个变换并入
-        let (base, other) = if submodel_point_count(&submodels[bi])
-            >= submodel_point_count(&submodels[bj])
-        {
-            (bi, bj)
-        } else {
-            (bj, bi)
-        };
-        let sub = submodels.remove(other);
-        let base = if base > other { base - 1 } else { base };
-        let (src, dst, n_shared_cams) = collect_merge_anchors(&submodels[base], &sub);
-
-        // 有共享相机时尺度由数据自由决定（位姿可靠）；无共享相机时薄接缝无法可靠
-        // 约束尺度，改用两个子模型各自场景尺度之比作为先验，避免自由拟合出错误的
-        // 缩小/放大尺度（曾出现 scale=0.392 把子模型缩小嵌套进主模型）。
-        let scale_prior = if n_shared_cams >= 4 {
-            None
-        } else {
-            Some(scene_spread(&submodels[base]) / scene_spread(&sub))
-        };
-
-        let (scale, rot, trans, n_inliers) = match robust_sim3(&src, &dst, scale_prior) {
-            Some(v) => v,
-            None => {
-                println!(
-                    "  Skip merging pair ({} imgs, anchors={}): no reliable Sim3",
-                    sub.num_registered(),
-                    src.len()
-                );
-                // 锚点最多的一对都失败，其余更不可能成功，终止
-                submodels.push(sub);
-                break;
-            }
-        };
-
-        // 可靠性门槛：有共享相机（位姿可靠）时可接受较少内点；纯 track 合并要求更多
-        let min_inliers = if n_shared_cams >= 4 { 4 } else { MIN_MERGE_SHARED_TRACKS };
-        if n_inliers < min_inliers {
-            println!(
-                "  Skip merging pair ({} imgs, anchors={} inliers={} < {}): too few inliers",
-                sub.num_registered(),
-                src.len(),
-                n_inliers,
-                min_inliers
-            );
-            submodels.push(sub);
-            break;
-        }
-
-        println!(
-            "  Merge sub-model: {} imgs, anchors={} ({} cams) inliers={} scale={:.3}",
-            sub.num_registered(),
-            src.len(),
-            n_shared_cams,
-            n_inliers,
-            scale
-        );
-        merge_submodel_into(&mut submodels[base], sub, scale, rot, trans);
     }
 
-    // 返回点数最多的子模型作为最终结果
-    submodels.into_iter().max_by_key(submodel_point_count).unwrap()
+    // ============ 全局联合配准（姿态图） ============
+    // 不再贪心两两合并（那会形成一条长链、误差逐级累积、把航线位置带乱）。改为：
+    //   1) 对每对共享锚点足够的子模型，用鲁棒刚体 RANSAC 估计相对变换（边）；
+    //   2) 以最大子模型为根，BFS 生成树求每个子模型的全局位姿（初始）；
+    //   3) 迭代平均：每个子模型用所有邻居的位姿提议取平均，把误差全局摊开；
+    //   4) 按全局位姿把子模型都变换到根坐标系并合并。
+
+    // 1) 建边：adj[i] = [(j, R_ij, t_ij, n_inliers)]，其中 X_j ≈ R_ij * X_i + t_ij（固定尺度 1）
+    // 1) 建边：adj[i] = [(j, s_ij, R_ij, t_ij, n_inliers)]，X_j ≈ s_ij * R_ij * X_i + t_ij。
+    // 尺度自由估计（各子模型本质矩阵单位基线在东西向/南北向种子上差 ~10%），并用范围保护。
+    let mut adj: Vec<Vec<(usize, f64, Matrix3<f64>, Vector3<f64>, usize)>> = vec![Vec::new(); n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (src, dst, n_cams) = collect_merge_anchors(&submodels[j], &submodels[i]);
+            if src.len() < 4 {
+                continue;
+            }
+            if let Some((s, r, t, n_inl)) = robust_sim3(&src, &dst, None) {
+                if n_inl >= 4 && n_cams >= 2 && (0.5..=2.0).contains(&s) {
+                    let inv_s = 1.0 / s;
+                    adj[i].push((j, s, r, t, n_inl));
+                    adj[j].push((i, inv_s, r.transpose(), -(r.transpose() * t) * inv_s, n_inl));
+                }
+            }
+        }
+    }
+
+    // 2) 以点数最多的子模型为根，BFS 生成树求初始全局位姿 (s_g, R_g, t_g)：
+    //    X_g = s_g[i] * R_g[i] * X_i + t_g[i]。根 (1, I, 0)。
+    let root = (0..n)
+        .max_by_key(|&i| submodel_point_count(&submodels[i]))
+        .unwrap();
+    let mut scale_g: Vec<f64> = vec![1.0; n];
+    let mut rot_g: Vec<Matrix3<f64>> = vec![Matrix3::identity(); n];
+    let mut trans_g: Vec<Vector3<f64>> = vec![Vector3::zeros(); n];
+    let mut visited = vec![false; n];
+    visited[root] = true;
+    let mut queue = vec![root];
+    let mut qi = 0usize;
+    while qi < queue.len() {
+        let i = queue[qi];
+        qi += 1;
+        for &(j, s_ij, r_ij, t_ij, _) in &adj[i] {
+            if !visited[j] {
+                visited[j] = true;
+                // 边 i→j: X_j = s_ij r_ij X_i + t_ij；由 X_g = s_i R_i X_i + t_i = s_j R_j X_j + t_j
+                // 得 R_j = R_i r_ij^T，s_j = s_i / s_ij，t_j = t_i - s_j R_j t_ij。
+                rot_g[j] = rot_g[i] * r_ij.transpose();
+                scale_g[j] = scale_g[i] / s_ij;
+                trans_g[j] = trans_g[i] - scale_g[j] * rot_g[j] * t_ij;
+                queue.push(j);
+            }
+        }
+    }
+
+    // 3) 迭代平均（根固定，Gauss-Seidel）：相似变换平均（旋转 Karcher 均值 + 尺度/平移加权
+    // 平均），把链式漂移与尺度不一致全局摊开。
+    for _ in 0..10 {
+        for i in 0..n {
+            if i == root || !visited[i] {
+                continue;
+            }
+            let mut acc_r = Matrix3::zeros();
+            let mut acc_s = 0.0f64;
+            let mut acc_t = Vector3::zeros();
+            let mut total_w = 0.0f64;
+            for &(j, s_ij, r_ij, t_ij, w) in &adj[i] {
+                // 由邻居 j 提议 i：X_g = s_j R_j (s_ij r_ij X_i + t_ij) + t_j
+                // => R_i = R_j r_ij，s_i = s_j s_ij，t_i = s_j R_j t_ij + t_j。
+                let wf = w as f64;
+                acc_r += (rot_g[j] * r_ij) * wf;
+                acc_s += (scale_g[j] * s_ij) * wf;
+                acc_t += (scale_g[j] * rot_g[j] * t_ij + trans_g[j]) * wf;
+                total_w += wf;
+            }
+            if total_w <= 0.0 {
+                continue;
+            }
+            let svd = SVD::new(acc_r, true, true);
+            if let (Some(u), Some(v_t)) = (svd.u, svd.v_t) {
+                let mut r_avg = u * v_t;
+                if r_avg.determinant() < 0.0 {
+                    r_avg = -r_avg;
+                }
+                rot_g[i] = r_avg;
+                scale_g[i] = acc_s / total_w;
+                trans_g[i] = acc_t / total_w;
+            }
+        }
+    }
+
+    // 4) 按相似变换（尺度+旋转+平移）把子模型变换到根坐标系并合并。
+    let mut subs: Vec<Option<Sfm>> = submodels.into_iter().map(Some).collect();
+    for i in 0..n {
+        if i == root || !visited[i] {
+            continue;
+        }
+        let s = subs[i].as_mut().unwrap();
+        for cam in s.cameras.iter_mut().flatten() {
+            cam.r = cam.r * rot_g[i].transpose();
+            cam.t = scale_g[i] * cam.t - cam.r * trans_g[i];
+        }
+        for p in s.points.iter_mut() {
+            if p.track_id != usize::MAX {
+                p.xyz = scale_g[i] * (rot_g[i] * p.xyz) + trans_g[i];
+            }
+        }
+    }
+    let mut merged = subs[root].take().unwrap();
+    for i in 0..n {
+        if i == root {
+            continue;
+        }
+        if let Some(sub) = subs[i].take() {
+            merge_submodel_into(&mut merged, sub, 1.0, Matrix3::identity(), Vector3::zeros());
+        }
+    }
+    println!(
+        "  Global registration: {}/{} sub-models connected (root {} imgs)",
+        visited.iter().filter(|&&v| v).count(),
+        n,
+        merged.num_registered()
+    );
+    merged
 }
 
 /// 多子模型重建：从多个强连接图像对分别启动增量重建，再按共享 track 合并。
@@ -3219,7 +3640,9 @@ fn reconstruct_multi_model(
 
     // 合并后做一次全局 BA：两个半区之间若有残余尺度/漂移，靠接缝处的共享观测联合优化
     // 校正（合并的闭式 Sim3 无法利用全部观测，只用了共享 track 的点位置）。
-    sfm.iterative_refinement(tracks, features, true, None);
+    if !DISABLE_GLOBAL_BA_DIAG {
+        sfm.iterative_refinement(tracks, features, true, None);
+    }
     sfm.update_point_errors(tracks, features);
 }
 
@@ -3236,11 +3659,77 @@ fn build_correspondence_index(matches: &[Match]) -> HashMap<(usize, usize), Vec<
     map
 }
 
+/// 可选：用图片 EXIF GPS 把重建对齐到米制 ENU（东/北/高）。
+///
+/// 不依赖 GPS 的通用路径照常工作：有 ≥3 张带 GPS 的已注册相机才做 Umeyama 相似变换
+/// （尺度+旋转+平移），把相机中心对齐到 GPS ENU 坐标，从而给重建一个米制尺度；无 GPS
+/// 时跳过，输出仍为任意尺度。这是纯后处理（一个全局相似变换），不影响 SfM 结构本身。
+#[allow(dead_code)]
+fn align_to_gps(sfm: &mut Sfm, paths: &[String]) {
+    let mut gps: Vec<Option<(f64, f64, f64)>> = vec![None; sfm.num_images];
+    let mut lats: Vec<f64> = Vec::new();
+    let mut lons: Vec<f64> = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        if let Ok(data) = fs::read(p) {
+            if let Some((lat, lon, alt)) = read_exif_gps(&data) {
+                gps[i] = Some((lat, lon, alt));
+                lats.push(lat);
+                lons.push(lon);
+            }
+        }
+    }
+    if lats.len() < 3 {
+        println!("  GPS align: only {} images have GPS (<3), keep arbitrary scale", lats.len());
+        return;
+    }
+    let lat0 = lats.iter().sum::<f64>() / lats.len() as f64;
+    let lon0 = lons.iter().sum::<f64>() / lons.len() as f64;
+    let m_lat = 111320.0;
+    let m_lon = 111320.0 * lat0.to_radians().cos();
+
+    let mut src: Vec<Vector3<f64>> = Vec::new();
+    let mut dst: Vec<Vector3<f64>> = Vec::new();
+    for (i, cam) in sfm.cameras.iter().enumerate() {
+        if let (Some(cam), Some((lat, lon, alt))) = (cam, gps[i]) {
+            src.push(camera_center(&cam.r, &cam.t));
+            dst.push(Vector3::new((lon - lon0) * m_lon, (lat - lat0) * m_lat, alt));
+        }
+    }
+    if src.len() < 3 {
+        println!("  GPS align: only {} registered cams have GPS, skip", src.len());
+        return;
+    }
+    let (scale, rot, trans) = match umeyama_sim3(&src, &dst) {
+        Some(v) => v,
+        None => {
+            println!("  GPS align: Umeyama degenerate, skip");
+            return;
+        }
+    };
+
+    // 点变换 X' = scale * rot * X + trans；相机 R' = R * rot^T，t' = scale*t - R'*trans
+    for cam in sfm.cameras.iter_mut().flatten() {
+        cam.r = cam.r * rot.transpose();
+        cam.t = scale * cam.t - cam.r * trans;
+    }
+    for p in sfm.points.iter_mut() {
+        if p.track_id != usize::MAX {
+            p.xyz = scale * (rot * p.xyz) + trans;
+        }
+    }
+    println!(
+        "  GPS align: {} registered cams aligned to ENU, scale={:.3}",
+        src.len(),
+        scale
+    );
+}
+
 pub(crate) fn run_incremental_sfm(
     matches: &[Match],
     features: &[ImageFeatures],
     tracks: &[Track],
     paths: &[String],
+    out: &crate::types::Paths,
 ) {
     let first_img = image::open(&paths[0]).expect("Failed to open first image");
     let (w, h) = (first_img.width(), first_img.height());
@@ -3268,6 +3757,27 @@ pub(crate) fn run_incremental_sfm(
     let mut sfm = Sfm::new(paths.len(), intrinsics);
     reconstruct_multi_model(&mut sfm, &index, features, tracks, paths);
 
+    // 补注册：暂禁用（怀疑其 grow_sub_model 触发的 BA 把尺度重新缩塌，见 2026-11-17 诊断）。
+    // 原逻辑：清零未注册图 reg_trials，在合并后的完整模型上再跑一轮增量注册捡回边缘图。
+    // let unregistered_before: usize = (0..sfm.num_images)
+    //     .filter(|&img| sfm.cameras[img].is_none())
+    //     .count();
+    // if unregistered_before > 0 {
+    //     for img in 0..sfm.num_images {
+    //         if sfm.cameras[img].is_none() {
+    //             sfm.reg_trials[img] = 0;
+    //         }
+    //     }
+    //     grow_sub_model(&mut sfm, &index, features, tracks, paths);
+    //     let unregistered_after: usize = (0..sfm.num_images)
+    //         .filter(|&img| sfm.cameras[img].is_none())
+    //         .count();
+    //     println!(
+    //         "  Post-merge re-registration: {} -> {} unregistered",
+    //         unregistered_before, unregistered_after
+    //     );
+    // }
+
     let registered = sfm.num_registered();
     println!(
         "Final: {}/{} images registered, {} points",
@@ -3284,6 +3794,35 @@ pub(crate) fn run_incremental_sfm(
         println!("  Sanitized {} wild camera(s)", fixed);
     }
 
+    // 约定尺度归一化：把相机轨迹的 RMS 半径归一到 1（同时平移使相机质心回到原点）。
+    // 单目 SfM 的绝对尺度不可观测，用这个确定性约定让不同运行的输出数值稳定、可比较
+    // （不用 GPS、不改变结构，只做全局相似变换）。
+    {
+        let centers: Vec<Vector3<f64>> = sfm
+            .cameras
+            .iter()
+            .flatten()
+            .map(|c| camera_center(&c.r, &c.t))
+            .collect();
+        if centers.len() >= 2 {
+            let n = centers.len() as f64;
+            let mean = centers.iter().fold(Vector3::zeros(), |a, b| a + *b) / n;
+            let rms = (centers.iter().map(|c| (c - mean).norm_squared()).sum::<f64>() / n).sqrt();
+            if rms > 1e-9 {
+                let s = 1.0 / rms;
+                for p in sfm.points.iter_mut() {
+                    if p.track_id != usize::MAX {
+                        p.xyz = (p.xyz - mean) * s;
+                    }
+                }
+                for cam in sfm.cameras.iter_mut().flatten() {
+                    cam.t = (cam.t + cam.r * mean) * s;
+                }
+                println!("  Normalized camera trajectory RMS radius to 1 (scale={:.4})", s);
+            }
+        }
+    }
+
     let (e0, e1, e2, ratio) = pca_check_cameras(&sfm);
     println!(
         "  Camera PCA: λ=({:.1},{:.1},{:.1}) ratio={:.3} {}",
@@ -3298,7 +3837,7 @@ pub(crate) fn run_incremental_sfm(
         }
     );
 
-    save_sparse_reconstruction(&sfm, features, tracks, paths);
+    save_sparse_reconstruction(&sfm, features, tracks, paths, out);
 }
 
 // ---------------------------------------------------------------------
@@ -3432,11 +3971,198 @@ fn filter_spatial_outliers(points: &mut Vec<(Vector3<f64>, u8, u8, u8)>) -> usiz
     removed
 }
 
+/// 局部 z 一致性过滤：把点分到粗格（约 40 格），每格求中位 z 并做几轮扩散填充空格，
+/// 再删掉偏离局部中位表面过远的离散点（跨航线假 track 三角化出的离群点）。只删 z 离群、
+/// 不碰 x/y，保留地形起伏。
+fn filter_local_z_outliers(points: &mut Vec<(Vector3<f64>, u8, u8, u8)>) -> usize {
+    let n = points.len();
+    if n < 200 {
+        return 0;
+    }
+    let mut mn = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
+    let mut mx = Vector3::new(f64::MIN, f64::MIN, f64::MIN);
+    for (p, _, _, _) in points.iter() {
+        mn = mn.inf(p);
+        mx = mx.sup(p);
+    }
+    let span = (mx - mn).norm().max(1.0);
+    let cell = (span / 40.0).max(0.05);
+    let nx = (((mx.x - mn.x) / cell).ceil() as usize).max(1) + 1;
+    let ny = (((mx.y - mn.y) / cell).ceil() as usize).max(1) + 1;
+    let mut grid: Vec<Vec<f64>> = vec![Vec::new(); nx * ny];
+    for (p, _, _, _) in points.iter() {
+        let gx = (((p.x - mn.x) / cell).floor() as usize).min(nx - 1);
+        let gy = (((p.y - mn.y) / cell).floor() as usize).min(ny - 1);
+        grid[gy * nx + gx].push(p.z);
+    }
+    let mut medz: Vec<Option<f64>> = vec![None; nx * ny];
+    for (i, g) in grid.iter().enumerate() {
+        if g.len() >= 5 {
+            let mut zs = g.clone();
+            zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            medz[i] = Some(zs[zs.len() / 2]);
+        }
+    }
+    // 扩散填充空格（3 轮 8 邻域平均）
+    for _ in 0..3 {
+        let old = medz.clone();
+        for y in 0..ny {
+            for x in 0..nx {
+                let idx = y * nx + x;
+                if medz[idx].is_some() {
+                    continue;
+                }
+                let mut s = 0.0;
+                let mut c = 0usize;
+                for dy in -1i64..=1 {
+                    for dx in -1i64..=1 {
+                        let xx = x as i64 + dx;
+                        let yy = y as i64 + dy;
+                        if xx >= 0 && yy >= 0 && xx < nx as i64 && yy < ny as i64 {
+                            if let Some(v) = old[(yy * nx as i64 + xx) as usize] {
+                                s += v;
+                                c += 1;
+                            }
+                        }
+                    }
+                }
+                if c > 0 {
+                    medz[idx] = Some(s / c as f64);
+                }
+            }
+        }
+    }
+    // 阈值：偏离局部中位 3 倍中位绝对偏差（对每点算 |z - medz|，取中位 MAD）
+    let mut devs: Vec<f64> = Vec::new();
+    for (p, _, _, _) in points.iter() {
+        let gx = (((p.x - mn.x) / cell).floor() as usize).min(nx - 1);
+        let gy = (((p.y - mn.y) / cell).floor() as usize).min(ny - 1);
+        if let Some(m) = medz[gy * nx + gx] {
+            devs.push((p.z - m).abs());
+        }
+    }
+    if devs.len() < 50 {
+        return 0;
+    }
+    devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mad = devs[devs.len() / 2].max(0.02);
+    let threshold = (6.0 * mad).max(0.15);
+    let before = points.len();
+    points.retain(|(p, _, _, _)| {
+        let gx = (((p.x - mn.x) / cell).floor() as usize).min(nx - 1);
+        let gy = (((p.y - mn.y) / cell).floor() as usize).min(ny - 1);
+        match medz[gy * nx + gx] {
+            Some(m) => (p.z - m).abs() <= threshold,
+            None => true,
+        }
+    });
+    let removed = before - points.len();
+    if removed > 0 {
+        println!("  Local-z filter: {} pts removed (z dev > {:.2})", removed, threshold);
+    }
+    removed
+}
+
+/// 温和的局部一致性过滤：粗格（约 60 格）中位表面 + 扩散，只删偏离局部表面超过大阈值
+/// （0.5 单位 ≈ 40m）的明显飞散假点。房子（高出地面 5~10m）不会被删，北部房区/葡萄园保留。
+fn filter_gentle_outliers(points: &mut Vec<(Vector3<f64>, u8, u8, u8)>) -> usize {
+    let n = points.len();
+    if n < 200 {
+        return 0;
+    }
+    let mut mn = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
+    let mut mx = Vector3::new(f64::MIN, f64::MIN, f64::MIN);
+    for (p, _, _, _) in points.iter() {
+        mn = mn.inf(p);
+        mx = mx.sup(p);
+    }
+    let ext = mx - mn;
+    let cell = (ext.x.max(ext.y) / 60.0).max(0.01);
+    let nx = ((ext.x / cell).ceil() as usize).max(2) + 1;
+    let ny = ((ext.y / cell).ceil() as usize).max(2) + 1;
+    let mut grid: Vec<Vec<f64>> = vec![Vec::new(); nx * ny];
+    for (p, _, _, _) in points.iter() {
+        let i = ((p.x - mn.x) / cell).floor() as usize;
+        let j = ((p.y - mn.y) / cell).floor() as usize;
+        if i < nx && j < ny {
+            grid[j * nx + i].push(p.z);
+        }
+    }
+    let mut medz: Vec<f64> = vec![f64::NAN; nx * ny];
+    for (k, g) in grid.iter().enumerate() {
+        if !g.is_empty() {
+            let mut g = g.clone();
+            g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            medz[k] = g[g.len() / 2];
+        }
+    }
+    for _ in 0..(nx + ny) {
+        let mut next = medz.clone();
+        for j in 0..ny {
+            for i in 0..nx {
+                let k = j * nx + i;
+                if !medz[k].is_nan() {
+                    continue;
+                }
+                let mut s = 0.0;
+                let mut c = 0i32;
+                for (di, dj) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)] {
+                    let ni = i as i64 + di;
+                    let nj = j as i64 + dj;
+                    if ni >= 0 && nj >= 0 && ni < nx as i64 && nj < ny as i64 {
+                        let nk = nj as usize * nx + ni as usize;
+                        if !medz[nk].is_nan() {
+                            s += medz[nk];
+                            c += 1;
+                        }
+                    }
+                }
+                if c > 0 {
+                    next[k] = s / c as f64;
+                }
+            }
+        }
+        medz = next;
+    }
+    let threshold = 0.5;
+    let before = points.len();
+    // 1) z 局部一致性：删偏离局部表面太远的点
+    points.retain(|(p, _, _, _)| {
+        let i = ((p.x - mn.x) / cell).floor() as usize;
+        let j = ((p.y - mn.y) / cell).floor() as usize;
+        if i >= nx || j >= ny {
+            return false;
+        }
+        let m = medz[j * nx + i];
+        if m.is_nan() {
+            return false;
+        }
+        (p.z - m).abs() <= threshold
+    });
+    // 2) 3D 距离百分位：删离质心最远的 1%（飞散假点在 x/y 上也远离主群）
+    if points.len() >= 200 {
+        let c = points
+            .iter()
+            .fold(Vector3::zeros(), |a, (p, _, _, _)| a + *p)
+            / points.len() as f64;
+        let mut dists: Vec<f64> = points.iter().map(|(p, _, _, _)| (p - c).norm()).collect();
+        dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let cutoff = dists[(dists.len() as f64 * 0.99) as usize];
+        points.retain(|(p, _, _, _)| (p - c).norm() <= cutoff);
+    }
+    let removed = before - points.len();
+    if removed > 0 {
+        println!("  Gentle filter: {} pts removed (z dev > {:.2} or 1% farthest)", removed, threshold);
+    }
+    removed
+}
+
 fn save_sparse_reconstruction(
     sfm: &Sfm,
     features: &[ImageFeatures],
     tracks: &[Track],
     paths: &[String],
+    out: &crate::types::Paths,
 ) {
     let num_registered = sfm.num_registered();
     println!("\n============ Final Reconstruction ============");
@@ -3473,8 +4199,38 @@ fn save_sparse_reconstruction(
         valid_pts.push((pt.xyz, r, g, b));
     }
 
-    let _ = filter_spatial_outliers(&mut valid_pts);
-    ransac_remove_planes(&mut valid_pts);
+    // 温和过滤：只删明显飞散/孤立的假点（重复纹理假 track），保留地面与房子。
+    let _ = filter_gentle_outliers(&mut valid_pts);
+
+    // 规定到所有图像中心点（相机中心）包围盒 + FOV 余量的正射范围内：相机覆盖区外的点删掉。
+    {
+        let mut cmin = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
+        let mut cmax = Vector3::new(f64::MIN, f64::MIN, f64::MIN);
+        let mut cam_n = 0usize;
+        for cam in sfm.cameras.iter().flatten() {
+            let c = cam.r.transpose() * (-cam.t);
+            cmin = cmin.inf(&c);
+            cmax = cmax.sup(&c);
+            cam_n += 1;
+        }
+        if cam_n > 0 {
+            // 只保留相机中心包围盒以内的数据（多视角覆盖区）；包围盒外只有边缘相机单视角
+            // 看到、精度无保证，直接删。不加 FOV 余量。
+            let margin = 0.0;
+            let before = valid_pts.len();
+            valid_pts.retain(|(p, _, _, _)| {
+                p.x >= cmin.x - margin && p.x <= cmax.x + margin
+                    && p.y >= cmin.y - margin && p.y <= cmax.y + margin
+            });
+            let removed = before - valid_pts.len();
+            if removed > 0 {
+                println!(
+                    "  Ortho-range filter: {} pts removed (outside camera bbox)",
+                    removed
+                );
+            }
+        }
+    }
 
     if valid_pts.is_empty() {
         println!("No valid 3D points");
@@ -3508,7 +4264,7 @@ fn save_sparse_reconstruction(
     }
     let centroid = sm / valid_pts.len() as f64;
 
-    fs::write("sparse.ply", &ply).unwrap();
+    fs::write(out.sparse_ply(), &ply).unwrap();
 
     let mut jposes: Vec<serde_json::Value> = Vec::new();
     for (i, cam) in sfm.cameras.iter().enumerate() {
@@ -3532,7 +4288,7 @@ fn save_sparse_reconstruction(
         "poses": jposes,
     });
     fs::write(
-        "camera_poses.json",
+        out.camera_poses_json(),
         serde_json::to_string_pretty(&jdata).unwrap(),
     )
     .unwrap();

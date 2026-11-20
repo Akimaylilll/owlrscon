@@ -13,7 +13,7 @@ use matching::{extract_features, match_all_pairs};
 use mvs::run_mvs_dense;
 use sfm::run_incremental_sfm;
 use tracks::{build_tracks, visualize_track_coverage_graph};
-use types::RATIO_THRESHOLD;
+use types::{Paths, RATIO_THRESHOLD};
 
 use std::fs;
 use std::time::Instant;
@@ -75,8 +75,9 @@ fn parse_stage(s: &str) -> Stage {
     }
 }
 
-fn parse_args() -> (String, i32, Stage) {
+fn parse_args() -> (String, i32, Stage, String) {
     let mut dir = String::from("./images");
+    let mut out = String::from("./out");
     let mut first_octave: i32 = 0;
     let mut stage = Stage::Mvs;
 
@@ -91,6 +92,10 @@ fn parse_args() -> (String, i32, Stage) {
             "-dir" => match value {
                 Some(v) => dir = v.to_string(),
                 None => eprintln!("Missing value for -dir"),
+            },
+            "-out" | "-output" | "-o" => match value {
+                Some(v) => out = v.to_string(),
+                None => eprintln!("Missing value for -out"),
             },
             "-first_octave" => match value {
                 Some(v) => {
@@ -111,31 +116,70 @@ fn parse_args() -> (String, i32, Stage) {
         }
     }
 
-    (dir, first_octave, stage)
+    (dir, first_octave, stage, out)
 }
 
-/// 从已有的 dense.ply 重建网格 → mesh.obj（2.5D DSM 高度场 + 顶点色）。
-/// 在 MVS 之后由 `-stage=mesh` / `-stage=texture` / `-stage=all` 调用。
-fn build_mesh_from_dense_ply() {
-    let (pts, _normals, colors) = crate::mesh::load_ply_xyz_normal("dense.ply");
-    if pts.is_empty() {
-        eprintln!("dense.ply 为空或不存在");
+/// 从已有的 sparse.ply（稀疏点云）重建网格 → mesh.obj。
+/// 绕开 dense MVS 在平坦农田上只有中央薄层的问题：用稀疏地表（DTM）+ 检测到的建筑屋顶
+/// 抬升来重建整个拍摄区域的表面，保证房区模型能立起来。
+fn build_mesh_from_dense_ply(out: &Paths) {
+    // 读 sparse.ply 的稀疏点（跳过相机中心红点 255 0 0）
+    let mut spts: Vec<(f64, f64, f64)> = Vec::new();
+    if let Ok(sp) = std::fs::read_to_string(&out.sparse_ply()) {
+        for line in sp.lines().skip(10) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 {
+                if let (Ok(x), Ok(y), Ok(z)) = (parts[0].parse(), parts[1].parse(), parts[2].parse())
+                {
+                    if parts[3] == "255" && parts[4] == "0" && parts[5] == "0" {
+                        continue; // 相机中心
+                    }
+                    spts.push((x, y, z));
+                }
+            }
+        }
+    }
+    if spts.is_empty() {
+        eprintln!("sparse.ply 为空或不存在");
         return;
     }
-    crate::mesh::build_mesh_dsm(
-        &pts,
-        colors.as_deref(),
-        &crate::mesh::DsmOptions::default(),
-        "mesh.obj",
-    );
+    println!("\n===== Building mesh from {} sparse points =====", spts.len());
+
+    // 检测建筑，生成密集屋顶点，把房区抬回屋顶高度
+    let buildings = crate::mesh::detect_buildings(&spts);
+    println!("  Building detection: {} buildings", buildings.len());
+    let mut mesh_pts = spts.clone();
+    for b in &buildings {
+        let step = ((b.xmax - b.xmin).max(b.ymax - b.ymin) / 40.0).max(0.01);
+        let mut x = b.xmin;
+        while x <= b.xmax {
+            let mut y = b.ymin;
+            while y <= b.ymax {
+                mesh_pts.push((x, y, b.roof));
+                y += step;
+            }
+            x += step;
+        }
+    }
+
+    // 稀疏点云用较粗网格 + min_pts=1（稀疏点每格只有零点几个，扩散填洞补全地表）
+    let opts = crate::mesh::DsmOptions {
+        max_side: 160,
+        fill_radius: 3,
+        min_pts: 1,
+    };
+    crate::mesh::build_mesh_dsm(&mesh_pts, None, &opts, &out.mesh_obj());
 }
 
 fn main() {
     let total_start = Instant::now();
 
-    let (image_dir, first_octave, stage) = parse_args();
+    let (image_dir, first_octave, stage, out_dir) = parse_args();
 
     backend::init();
+
+    let out = Paths::new(&out_dir);
+    out.ensure_dirs();
 
     let paths = load_image_paths(&image_dir);
     if paths.is_empty() {
@@ -144,14 +188,14 @@ fn main() {
     }
     println!("Found {} images\n", paths.len());
 
-    let features = extract_features(&paths, first_octave);
+    let features = extract_features(&paths, first_octave, &out.features_cache_dir());
     if stage <= Stage::Features {
         let total_elapsed = total_start.elapsed();
         println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());
         return;
     }
 
-    let matches = match_all_pairs(&features, RATIO_THRESHOLD);
+    let matches = match_all_pairs(&features, RATIO_THRESHOLD, &out.matches_cache_dir());
     if stage <= Stage::Matches {
         let total_elapsed = total_start.elapsed();
         println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());
@@ -173,7 +217,7 @@ fn main() {
         return;
     }
 
-    run_incremental_sfm(&matches, &features, &tracks, &paths);
+    run_incremental_sfm(&matches, &features, &tracks, &paths, &out);
     if stage <= Stage::Sfm {
         let total_elapsed = total_start.elapsed();
         println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());
@@ -181,7 +225,7 @@ fn main() {
     }
 
     // MVS Dense Reconstruction
-    run_mvs_dense(&paths);
+    run_mvs_dense(&paths, &out);
     if stage <= Stage::Mvs {
         let total_elapsed = total_start.elapsed();
         println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());
@@ -189,7 +233,7 @@ fn main() {
     }
 
     // `-stage=mesh` / `-stage=texture` / `-stage=all`：MVS 之后接着做网格重建。
-    build_mesh_from_dense_ply();
+    build_mesh_from_dense_ply(&out);
     if stage <= Stage::Mesh {
         let total_elapsed = total_start.elapsed();
         println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());
@@ -199,11 +243,11 @@ fn main() {
     // 贴图与正射影像相互独立，都只依赖 mesh 阶段产物（mesh.obj + 相机 + 深度图），
     // 按 stage 显式调度，互不依赖：-stage=texture 只贴图、-stage=ortho 只正射、-stage=all 都做。
     match stage {
-        Stage::Texture | Stage::All => crate::texture::run_texture(&paths),
+        Stage::Texture | Stage::All => crate::texture::run_texture(&paths, &out),
         _ => {}
     }
     match stage {
-        Stage::Ortho | Stage::All => crate::ortho::run_ortho(&paths),
+        Stage::Ortho | Stage::All => crate::ortho::run_ortho(&paths, &out),
         _ => {}
     }
     let total_elapsed = total_start.elapsed();

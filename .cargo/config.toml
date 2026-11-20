@@ -1,5 +1,5 @@
 [alias]
-demo = "run --release -- -dir=./images -first_octave=0 -stage=coverage"
+demo = "run --release -- -dir=./images -first_octave=0 -stage=all"
 
 #features/sift	SIFT 特征提取
 #matches/match	特征匹配

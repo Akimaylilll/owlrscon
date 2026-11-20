@@ -106,8 +106,38 @@ impl From<CachedImageFeatures> for ImageFeatures {
 /// let paths = load_image_paths("./images");
 /// let features = extract_features(&paths, 0);
 /// ```
-pub(crate) fn extract_features(paths: &[String], first_octave: i32) -> Vec<ImageFeatures> {
-    let cache_dir = crate::types::FEATURES_CACHE_DIR;
+///
+/// 网格均匀挑选：把 SIFT 输出的 top-N 特征按 ~256px 网格分桶，每格保留最强的
+/// `target/n_cells` 个（输入按响应降序，所以先遇到的就是强的）。这样低纹理区（房顶/农田）
+/// 也能分到特征，不会被高纹理区（公路）占满预算。
+fn bucket_keypoints(
+    kps: Vec<KeyPoint>,
+    descs: Vec<Vec<f32>>,
+    w: u32,
+    h: u32,
+    target: usize,
+) -> (Vec<KeyPoint>, Vec<Vec<f32>>) {
+    let cell = 256.0f32;
+    let nx = ((w as f32 / cell).ceil() as usize).max(1);
+    let ny = ((h as f32 / cell).ceil() as usize).max(1);
+    let per_cell = (target / (nx * ny)).max(1);
+    let mut counts = vec![0usize; nx * ny];
+    let mut out_k: Vec<KeyPoint> = Vec::with_capacity(target);
+    let mut out_d: Vec<Vec<f32>> = Vec::with_capacity(target);
+    for (kp, d) in kps.into_iter().zip(descs.into_iter()) {
+        let i = ((kp.x / cell).floor() as usize).min(nx - 1);
+        let j = ((kp.y / cell).floor() as usize).min(ny - 1);
+        let idx = j * nx + i;
+        if counts[idx] < per_cell {
+            counts[idx] += 1;
+            out_k.push(kp);
+            out_d.push(d);
+        }
+    }
+    (out_k, out_d)
+}
+
+pub(crate) fn extract_features(paths: &[String], first_octave: i32, cache_dir: &str) -> Vec<ImageFeatures> {
     fs::create_dir_all(cache_dir).expect("Failed to create features_cache directory");
 
     println!(
@@ -158,14 +188,19 @@ pub(crate) fn extract_features(paths: &[String], first_octave: i32) -> Vec<Image
                     gray = gray.resize(nw, nh, image::imageops::FilterType::Triangle);
                 }
                 let mut params = SiftParams {
-                    max_num_features: 8192,
+                    max_num_features: 32768,
                     first_octave,
                     num_octaves: 4,
                     edge_threshold: 10.0,
                     ..SiftParams::default()
                 };
-                params.peak_threshold = 0.02 / params.octave_resolution as f32;
+                params.peak_threshold = 0.01 / params.octave_resolution as f32;
                 let (keypoints, descriptors) = sift.detect_and_compute(gray, &params);
+                // 网格均匀挑选：SIFT 返回的 top-32768 集中在高纹理区（公路），低纹理的房顶/
+                // 农田几乎没有。按 ~256px 网格每格保留最强的 target/n_cells 个，把特征铺满整图，
+                // 让低纹理区也能有稀疏点。
+                let (keypoints, descriptors) =
+                    bucket_keypoints(keypoints, descriptors, nw, nh, 8192);
 
                 let result = ImageFeatures {
                     path: path.clone(),
@@ -582,14 +617,13 @@ fn guided_matching(
 /// ```rust,ignore
 /// let matches = match_all_pairs(&features, 0.8);
 /// ```
-pub(crate) fn match_all_pairs(features: &[ImageFeatures], ratio_threshold: f32) -> Vec<Match> {
+pub(crate) fn match_all_pairs(features: &[ImageFeatures], ratio_threshold: f32, cache_dir: &str) -> Vec<Match> {
     let num_images = features.len();
 
     let pairs: Vec<(usize, usize)> = (0..num_images)
         .flat_map(|i| ((i + 1)..num_images).map(move |j| (i, j)))
         .collect();
 
-    let cache_dir = crate::types::MATCHES_CACHE_DIR;
     fs::create_dir_all(cache_dir).expect("Failed to create matches_cache directory");
 
     println!(
