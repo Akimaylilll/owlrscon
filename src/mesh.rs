@@ -33,28 +33,28 @@ const DSM_MIN_PTS: u32 = 3;
 const DSM_MED_K: usize = 3;
 const DSM_MED_PASSES: usize = 1;
 
-/// 中值滤波的边保护容差：邻点与中心高度差超过该值即视为跨越陡边（墙/台阶），
-/// 不纳入该格的中值统计——中值滤波因此只压平面噪声、不抹平竖直墙。
-/// 取 0.5：与 [`DSM_STRUCT_THRESH`] 一致；深度噪声 ±0.15 远小于此、真实墙高差远大于此。
-const DSM_MED_EDGE_TOL: f64 = 0.5;
+/// 高度阈值全部按「z 起伏（p2~p98 范围）」的分数取，无量纲、适配任意尺度：米制或
+/// 归一化尺度都不用再改这些值。原绝对米值（0.5/1.0/1.1）是按归一化尺度调的，米制下
+/// ~90m 起伏会把它们压成「到处都是结构/尖峰」，把 DSM 削成碎片。
+/// 中值滤波的边保护容差：邻点与中心高度差超过 relief×该分数即视为跨越陡边（墙/台阶）。
+const DSM_MED_EDGE_TOL_FRAC: f64 = 0.02;
 
-/// 结构清理：高度超出局部地面该阈值即视为"抬升结构"。
-const DSM_STRUCT_THRESH: f64 = 0.5;
+/// 结构清理：高度超出局部地面（30% 分位）relief×该分数即视为"抬升结构"。
+const DSM_STRUCT_THRESH_FRAC: f64 = 0.03;
 
 /// 结构清理：抬升连通块背后支撑点少于该值即判定为离群针尖，整体压掉。
 /// 真实屋顶有数百~数千点；5~39 点的孤立柱是 MVS 误匹配簇。
 const DSM_MIN_STRUCT_PTS: u32 = 40;
 
-/// 稀疏尖峰压平：支撑点不足（< DSM_MIN_PTS）的格点，若比其 8 邻域最低值高出该
-/// 高度差，即判定为"针状柱体"格点并压掉（置 NEG_INFINITY，随后由平缓空洞填补
+/// 稀疏尖峰压平：支撑点不足（< DSM_MIN_PTS）的格点，若比其 8 邻域最低值高出
+/// relief×该分数即判定为"针状柱体"格点并压掉（置 NEG_INFINITY，随后由平缓空洞填补
 /// 回地面）。这些格点本身几乎无真实点支撑，是中值滤波把屋顶/地形边缘扩散到
-/// 空腔上造出的假尖。实测把长边 >1.0 的针面从 52 条压到 0 条。
-const DSM_SPIKE_DROP: f64 = 1.0;
+/// 空腔上造出的假尖。
+const DSM_SPIKE_DROP_FRAC: f64 = 0.03;
 
-/// 平缓空洞填补：内部空腔（不与网格边界相连）的边界高度跨度低于该值才填，
-/// 跨度大的崖面缺口（填了反而造出陡斜面）保持为洞。1.1 能填平缓坡缺口
-/// （如 268 格的缓坡、跨度 ~1.0）又避开真正的崖面（跨度 ~1.18+）。
-const DSM_HOLE_RANGE: f64 = 1.1;
+/// 三角化后连通分量过滤：顶点数少于此值的孤立浮空小块丢弃（噪声），其余全保留。
+const DSM_MIN_COMPONENT_VERTICES: usize = 50;
+
 
 /// DSM（高度场）重建参数：把点云当作 2.5D 地形表面，按 (x,y) 网格取每格中位数高度
 /// （稳健，抗逐格噪声尖峰），剔除稀疏格点后直接三角化成单一连通表面。航拍地形的房屋
@@ -185,7 +185,10 @@ fn write_mesh_obj(
     fs::write(path, &s).expect("Failed to write mesh");
 }
 
-/// 只保留最大连通分量，丢弃游离的小碎片（重建尾部总有一些边界孤立片）。
+/// 丢弃过小的连通分量（游离浮空碎片/噪声），其余全保留。
+///
+/// 不再只留最大块：密集点云在低纹理区有覆盖缺口，表面可能裂成几块，只留最大块会把
+/// 边缘真实地表一起丢掉（黑洞）。只丢顶点数 < [`DSM_MIN_COMPONENT_VERTICES`] 的孤立小块。
 fn keep_largest_component(
     verts: Vec<Vector3<f64>>,
     tris: Vec<[usize; 3]>,
@@ -201,7 +204,7 @@ fn keep_largest_component(
         }
     }
     let mut seen = vec![false; verts.len()];
-    let mut best: Vec<usize> = Vec::new();
+    let mut comps: Vec<Vec<usize>> = Vec::new();
     for s in 0..verts.len() {
         if seen[s] {
             continue;
@@ -218,15 +221,18 @@ fn keep_largest_component(
                 }
             }
         }
-        if comp.len() > best.len() {
-            best = comp;
-        }
+        comps.push(comp);
     }
     let mut remap: Vec<Option<usize>> = vec![None; verts.len()];
-    let mut out_v: Vec<Vector3<f64>> = Vec::with_capacity(best.len());
-    for &v in &best {
-        remap[v] = Some(out_v.len());
-        out_v.push(verts[v]);
+    let mut out_v: Vec<Vector3<f64>> = Vec::new();
+    for comp in &comps {
+        if comp.len() < DSM_MIN_COMPONENT_VERTICES {
+            continue;
+        }
+        for &v in comp {
+            remap[v] = Some(out_v.len());
+            out_v.push(verts[v]);
+        }
     }
     let mut out_f: Vec<[usize; 3]> = Vec::new();
     for t in &tris {
@@ -281,10 +287,16 @@ fn dsm_fill(hgt: &mut [f64], foot: &[bool], nx: usize, ny: usize) {
 }
 
 /// 高度场 k×k 中值滤波（多遍）：压掉逐格噪声尖峰，但**跨陡边不混值**——只把与中心
-/// 高度差 ≤ [`DSM_MED_EDGE_TOL`] 的邻点纳入统计，屋顶/地面不互相拉低/抬高，竖直墙
-/// 得以保留。空（NEG_INFINITY）格点既不参与统计、也不会被填充。逐遍读取快照、写回，
-/// 保证确定性。
-fn dsm_median_filter(hgt: &mut [f64], nx: usize, ny: usize, k: usize, passes: usize) {
+/// 高度差 ≤ `edge_tol` 的邻点纳入统计，屋顶/地面不互相拉低/抬高，竖直墙得以保留。
+/// 空（NEG_INFINITY）格点既不参与统计、也不会被填充。逐遍读取快照、写回，保证确定性。
+fn dsm_median_filter(
+    hgt: &mut [f64],
+    nx: usize,
+    ny: usize,
+    k: usize,
+    passes: usize,
+    edge_tol: f64,
+) {
     let idx = |i: usize, j: usize| i * (ny + 1) + j;
     let r = (k / 2) as isize;
     let mut buf: Vec<f64> = Vec::with_capacity(k * k);
@@ -313,7 +325,7 @@ fn dsm_median_filter(hgt: &mut [f64], nx: usize, ny: usize, k: usize, passes: us
                         }
                         let nk = idx(ni as usize, nj as usize);
                         let v = src[nk];
-                        if v != f64::NEG_INFINITY && (v - c).abs() <= DSM_MED_EDGE_TOL {
+                        if v != f64::NEG_INFINITY && (v - c).abs() <= edge_tol {
                             buf.push(v);
                         }
                     }
@@ -326,6 +338,9 @@ fn dsm_median_filter(hgt: &mut [f64], nx: usize, ny: usize, k: usize, passes: us
 }
 
 /// 建筑 footprint + 屋顶高度（用于在稀疏 DTM 上把房区抬升回屋顶）。
+/// 当前 mesh 用 dense 表面、不再调用建筑抬升（见 round 36/39 教训：稀疏墙点 + max 抬升
+/// 会造出针状面），此检测保留备查。
+#[allow(dead_code)]
 pub(crate) struct Building {
     pub(crate) xmin: f64,
     pub(crate) xmax: f64,
@@ -336,6 +351,7 @@ pub(crate) struct Building {
 
 /// 从稀疏点云检测建筑：2D 格内 z 跨度大（垂直墙）+ 4 连通聚类 + 过滤。
 /// 地形是缓坡（格内 z 跨度小），建筑墙是垂直的（格内 z 跨度大），据此分离。
+#[allow(dead_code)]
 pub(crate) fn detect_buildings(points: &[(f64, f64, f64)]) -> Vec<Building> {
     let n = points.len();
     if n < 100 {
@@ -517,6 +533,15 @@ pub fn build_mesh_dsm(
         println!("  点云 x/y 包围盒退化，跳过");
         return;
     }
+    // z 起伏（稳健 p2~p98）：把高度阈值无量纲化，适配米制/任意尺度。
+    let mut zvals: Vec<f64> = points.iter().map(|&(_, _, z)| z).collect();
+    zvals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let z_lo = zvals[((zvals.len() as f64) * 0.02) as usize];
+    let z_hi = zvals[((zvals.len() as f64) * 0.98) as usize];
+    let relief = (z_hi - z_lo).max(1e-6);
+    let edge_tol = relief * DSM_MED_EDGE_TOL_FRAC;
+    let struct_thresh = relief * DSM_STRUCT_THRESH_FRAC;
+    let spike_drop = relief * DSM_SPIKE_DROP_FRAC;
     let cell = max_ext / opts.max_side as f64;
     let nx = ((extx / cell).ceil() as usize).max(2);
     let ny = ((exty / cell).ceil() as usize).max(2);
@@ -579,10 +604,10 @@ pub fn build_mesh_dsm(
     dsm_fill(&mut hgt, &foot, nx, ny);
 
     // ---- 5) k×k 边保护中值滤波：压掉逐格噪声尖峰，跨陡边不混值（不抹竖直墙） ----
-    dsm_median_filter(&mut hgt, nx, ny, DSM_MED_K, DSM_MED_PASSES);
+    dsm_median_filter(&mut hgt, nx, ny, DSM_MED_K, DSM_MED_PASSES, edge_tol);
 
     // ---- 6) 结构清理：压掉支撑点过少的孤立抬升柱（"石林/针状面"根因） ----
-    //   局部地面 = 有限高度的 30% 分位；高出 DSM_STRUCT_THRESH 即视为抬升结构。
+    //   局部地面 = 有限高度的 30% 分位；高出 struct_thresh 即视为抬升结构。
     let mut vals: Vec<f64> = hgt
         .iter()
         .filter(|&&v| v != f64::NEG_INFINITY)
@@ -591,7 +616,7 @@ pub fn build_mesh_dsm(
     if !vals.is_empty() {
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let g0 = vals[((vals.len() as f64) * 0.3) as usize];
-        let thresh = g0 + DSM_STRUCT_THRESH;
+        let thresh = g0 + struct_thresh;
         // 抬升格点 4 邻域连通标号，累计每个块背后的原始支撑点数。
         let mut label = vec![0usize; total];
         let mut comp_pts: Vec<u32> = Vec::new();
@@ -662,10 +687,10 @@ pub fn build_mesh_dsm(
     }
 
     // 最后一遍轻度中值滤波，抹平结构清理后重新扩散填平处的细微边界。
-    dsm_median_filter(&mut hgt, nx, ny, 3, 1);
+    dsm_median_filter(&mut hgt, nx, ny, 3, 1, edge_tol);
 
     // ---- 6b) 稀疏尖峰压平：支撑点不足（< DSM_MIN_PTS）却比 8 邻域最低值高出
-    //          DSM_SPIKE_DROP 以上的格点 = 针状柱体。这些格点几乎无真实点支撑，
+    //          spike_drop 以上的格点 = 针状柱体。这些格点几乎无真实点支撑，
     //          是中值滤波把屋顶/地形边缘扩散到空腔上造出的假尖；压掉后由下一步
     //          平缓空洞填补回地面。快照读、就地写，保证确定性。 ----
     {
@@ -694,7 +719,7 @@ pub fn build_mesh_dsm(
                         }
                     }
                 }
-                if mn != f64::INFINITY && src[k] - mn > DSM_SPIKE_DROP {
+                if mn != f64::INFINITY && src[k] - mn > spike_drop {
                     hgt[k] = f64::NEG_INFINITY;
                     capped += 1;
                 }
@@ -705,9 +730,10 @@ pub fn build_mesh_dsm(
         }
     }
 
-    // ---- 6c) 平缓空洞填补：内部空腔（4 邻域连通、不贴网格边界）中边界高度跨度
-    //          低于 DSM_HOLE_RANGE 者填平（道路/缓坡缺口）；跨度大的崖面缺口保持为洞，
-    //          避免填出陡斜面。无任何有限邻点的孤立空腔填不动，仍留作洞。 ----
+    // ---- 6c) 空洞填补：所有空腔（4 邻域连通，含贴网格边界的）一律用边界邻点扩散填平。
+    //          密集点云在低纹理区有覆盖缺口，这些缺口和陡坡/崖面一样是真实地表，填成斜面
+    //          比留洞好（留洞会让三角化碎片化、边界留黑边）。无任何有限邻点的孤立空腔
+    //          填不动，仍留洞。 ----
     {
         let mut visited = vec![false; total];
         let mut fill_mask = vec![false; total];
@@ -723,14 +749,10 @@ pub fn build_mesh_dsm(
                 let mut cells: Vec<usize> = Vec::new();
                 let mut stack = vec![k0];
                 visited[k0] = true;
-                let mut touches_border = false;
                 while let Some(k) = stack.pop() {
                     let ci = k / (ny + 1);
                     let cj = k % (ny + 1);
                     cells.push(k);
-                    if ci == 0 || ci == nx || cj == 0 || cj == ny {
-                        touches_border = true;
-                    }
                     let mut nbs = [usize::MAX; 4];
                     let mut nn = 0usize;
                     if ci > 0 {
@@ -757,12 +779,8 @@ pub fn build_mesh_dsm(
                         }
                     }
                 }
-                if touches_border {
-                    continue;
-                }
-                // 空腔边界 = 其所有 8 邻域中的有限高度；跨度 = max-min。
+                // 空腔边界 = 其所有 8 邻域中的有限高度。
                 let mut bmin = f64::INFINITY;
-                let mut bmax = f64::NEG_INFINITY;
                 for &k in &cells {
                     let ci = k / (ny + 1);
                     let cj = k % (ny + 1);
@@ -779,12 +797,11 @@ pub fn build_mesh_dsm(
                             let nk = idx(ni as usize, nj as usize);
                             if hgt[nk] != f64::NEG_INFINITY {
                                 bmin = bmin.min(hgt[nk]);
-                                bmax = bmax.max(hgt[nk]);
                             }
                         }
                     }
                 }
-                if bmin != f64::INFINITY && (bmax - bmin) < DSM_HOLE_RANGE {
+                if bmin != f64::INFINITY {
                     for &k in &cells {
                         fill_mask[k] = true;
                         to_fill += 1;

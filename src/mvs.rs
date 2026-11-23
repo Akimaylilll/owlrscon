@@ -313,6 +313,8 @@ struct RegCam {
     f: f64,
     gray: Vec<u8>,
     path: String,
+    /// 相机 GPS 海拔（ENU 米制，来自 camera_poses.json 的 gps_z）。无 GPS 时为 None。
+    gps_z: Option<f64>,
 }
 
 /// 在 CPU 上计算 (2*half+1)×(2*half+1) 窗口的 Census 码（9×9 → 80 位，3×u32/像素，rayon 并行）。
@@ -1325,6 +1327,44 @@ fn bilateral_smooth(depth: &[f32], gray: &[u8], iw: usize, ih: usize) -> Vec<f32
     smoothed
 }
 
+/// 深度图中值滤波（5×5）：压掉 PatchMatch 在低纹理区漂出的孤立深度尖峰，让后续正射的
+/// 遮挡判断更稳（尖峰深度会造成误遮挡→黑点、误放行→白点）。跳过无效深度（<=0）。
+fn median_filter_depth(depth: &[f32], iw: usize, ih: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    let radius = 2usize; // 5×5
+    let mut out = depth.to_vec();
+    out.par_chunks_mut(iw)
+        .enumerate()
+        .for_each(|(y, row)| {
+            if y < radius || y >= ih - radius {
+                return;
+            }
+            for x in radius..iw - radius {
+                let idx = y * iw + x;
+                if depth[idx] <= 0.0 {
+                    continue;
+                }
+                let mut vals: [f32; 25] = [0.0; 25];
+                let mut n = 0usize;
+                for dy in -(radius as i64)..=(radius as i64) {
+                    for dx in -(radius as i64)..=(radius as i64) {
+                        let j = (y as i64 + dy) as usize * iw + (x as i64 + dx) as usize;
+                        let d = depth[j];
+                        if d > 0.0 {
+                            vals[n] = d;
+                            n += 1;
+                        }
+                    }
+                }
+                if n > 0 {
+                    vals[..n].sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    row[x] = vals[n / 2];
+                }
+            }
+        });
+    out
+}
+
 /// 单相机深度图写盘：depth(n) + normal(n×3) + costs(n)，全部 f32。
 fn write_depth_map(si: usize, depth: &[f32], normal: &[[f32; 3]], costs: &[f32], dm_dir: &str) {
     let mut flat: Vec<f32> = Vec::with_capacity(depth.len() * 5);
@@ -1368,6 +1408,7 @@ pub(crate) fn run_mvs_dense(paths: &[String], out: &crate::types::Paths) {
         println!("Need >=2 cameras");
         return;
     }
+    let gps_aligned = pose_data["gps_aligned"].as_bool().unwrap_or(false);
 
     println!("Loading {} images...", poses.len());
     let first_img = image::open(&paths[0]).expect("Failed open");
@@ -1429,6 +1470,7 @@ pub(crate) fn run_mvs_dense(paths: &[String], out: &crate::types::Paths) {
             f: f_full / scale as f64,
             gray: gray_u8,
             path: paths[img_idx].clone(),
+            gps_z: pv["gps_z"].as_f64(),
         });
     }
     if cams.len() < 2 {
@@ -1444,6 +1486,7 @@ pub(crate) fn run_mvs_dense(paths: &[String], out: &crate::types::Paths) {
     let mut median_depth = 20.0f64;
     let mut sparse_bbox: Option<(Vector3<f64>, Vector3<f64>)> = None;
     let mut sparse_pts: Vec<Vector3<f64>> = Vec::new();
+    let mut z_ground = f64::NAN;
     if let Ok(sp) = fs::read_to_string(out.sparse_ply()) {
         for line in sp.lines().skip(10) {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -1469,6 +1512,13 @@ pub(crate) fn run_mvs_dense(paths: &[String], out: &crate::types::Paths) {
             sparse_pts.len(),
             sparse_pts.len() as f64 / sparse_before as f64 * 100.0
         );
+
+        // 地面海拔（sparse z 中位），供 GPS 海拔兜底深度范围用
+        if !sparse_pts.is_empty() {
+            let mut zs: Vec<f64> = sparse_pts.iter().map(|p| p.z).collect();
+            zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            z_ground = zs[zs.len() / 2];
+        }
 
         if sparse_pts.len() > 20 {
             // 用「相机中心包围盒」约束稠密重建（多视角覆盖区），只保留图像中心点以内的点，
@@ -1526,6 +1576,27 @@ pub(crate) fn run_mvs_dense(paths: &[String], out: &crate::types::Paths) {
         }
     }
 
+    // GPS 海拔兜底：视野内 sparse 点太少、深度范围仍是默认 (1,300) 的相机，用相机 GPS 海拔
+    // 与地面海拔差（≈飞行高度量级）估计一个更紧的深度范围。无 GPS 时 gps_aligned=false 跳过。
+    if gps_aligned && z_ground.is_finite() {
+        let mut gps_fallback = 0usize;
+        for ci in 0..nc {
+            if cam_depths[ci].0 == 1.0 && cam_depths[ci].1 == 300.0 {
+                if let Some(z_cam) = cams[ci].gps_z {
+                    let dz = (z_cam - z_ground).abs().max(1.0);
+                    cam_depths[ci] = (dz * 0.3, dz * 3.0);
+                    gps_fallback += 1;
+                }
+            }
+        }
+        if gps_fallback > 0 {
+            println!(
+                "  GPS depth fallback: {} sparse-poor cameras got range from altitude",
+                gps_fallback
+            );
+        }
+    }
+
     // 按基线距离选邻帧：基线太小深度分辨率差（几乎等于单目），取接近 0.25*中位深度的基线，
     // 既保证足够视差又避免过远导致的遮挡/外观变化。
     let target_base = median_depth * 0.25;
@@ -1556,7 +1627,10 @@ pub(crate) fn run_mvs_dense(paths: &[String], out: &crate::types::Paths) {
     // PatchMatch 逐参考图像估计深度/法向（80-bit Census + 连续法向，传播 + 扰动，并行）。
     // 全分辨率 + 9×9 Census(3×u32) + 8 邻帧下，每相机 GPU 缓冲约 2.5GB，
     // 用保守估计把并行度压到 1，保证显存安全。
-    let mvs_threads = crate::backend::parallelism(iw as usize * ih as usize * 300 + (1 << 20));
+    // 全分辨率 MVS 每相机 GPU 缓冲约 6GB（census+gray+depth/normal/cost）；统一内存的 Mac 上
+    // 并行度 >1 会让两个 ~6GB 任务同时驻留（~12GB），压爆内存 → Metal/wgpu 原生 segfault。
+    // 强制单线程（代码注释里「用保守估计把并行度压到 1」的本意），慢但安全。
+    let mvs_threads = crate::backend::parallelism(iw as usize * ih as usize * 300 + (1 << 20)).min(1);
     println!("  MVS parallelism: {} threads", mvs_threads);
     println!(
         "  memory before PatchMatch: {}",
@@ -1644,6 +1718,7 @@ pub(crate) fn run_mvs_dense(paths: &[String], out: &crate::types::Paths) {
             println!("[DEBUG] cam {} depth {}", si, depth_stats_line(&d, &c));
             println!("[DEBUG] cam {} hist  {}", si, depth_histogram(&d, 10));
             let d = bilateral_smooth(&d, &cams[si].gray, iw as usize, ih as usize);
+            let d = median_filter_depth(&d, iw as usize, ih as usize);
             write_depth_map(si, &d, &n, &c, &out.mvs_dm_dir());
             pb.inc(1);
         });

@@ -17,9 +17,11 @@ use nalgebra::{Matrix3, Vector3};
 
 /// 视锥边界留白（像素）：像素离图像边缘太近视为不可靠。
 const FRUSTUM_BORDER: f64 = 2.0;
-/// 遮挡测试容差（与 texture.rs 一致，先放宽）：深度显著大于深度图记录值即判被挡。
-const OCC_TOL_REL: f64 = 0.10;
-const OCC_TOL_ABS: f64 = 2.0;
+/// 遮挡测试容差：深度显著大于深度图记录值即判被挡。深度图在低纹理区/建筑边缘噪声大
+/// （std 可达十几米），容差过小会把大量可见像素误判成被挡（房子边缘黑边、屋顶被第二台
+/// 斜视相机接管→错误内容）。放宽后减少误判；代价是极少数真被挡处会放进来（可接受）。
+const OCC_TOL_REL: f64 = 0.15;
+const OCC_TOL_ABS: f64 = 5.0;
 /// 与 MVS 融合一致的置信度阈值。
 const COST_MIN: f32 = 0.6;
 /// 逐相机白平衡/曝光增益上下限。
@@ -27,6 +29,13 @@ const GAIN_MIN: f64 = 0.5;
 const GAIN_MAX: f64 = 2.0;
 /// 输出总像素上限：超出自适应放宽 GSD，保护内存（4G 下限）。
 const MAX_ORTHO_PX: u64 = 64_000_000;
+
+/// 去噪点：非黑非白像素与正常邻点中值的通道差之和超过该阈值即视为孤立杂色噪点，替换。
+const DESPECKLE_DIFF: i32 = 120;
+/// 白色噪点阈值：三通道都超过该值视为白点/过曝（与黑点一起用正常邻点中值填掉）。
+const WHITE_THRESHOLD: i32 = 230;
+/// 去噪点/填黑/填白迭代遍数：每遍从黑白区边缘向里填一圈，可填掉几像素宽的噪点/条纹。
+const DESPECKLE_PASSES: usize = 8;
 #[allow(dead_code)]
 const OUT_PREFIX: &str = "ortho";
 
@@ -600,8 +609,9 @@ fn generate_ortho(cams: &[Cam], verts: &[Vector3<f64>], tris: &[[usize; 3]], out
         }
     }
 
-    // 累积缓冲：r,g,b,w（f32）。
-    let mut acc = vec![0.0f32; w * h * 4];
+    // 每像素取「最正对/最居中的那台相机」独占（权值最大的相机），不做多相机平均。
+    let mut best_w = vec![0.0f32; w * h];
+    let mut best_rgb = vec![[0u8; 3]; w * h];
     let (mut c_no_footprint, mut c_no_depth, mut c_no_img) = (0usize, 0usize, 0usize);
     let mut c_accumulated = 0usize;
     for ci in 0..nc {
@@ -663,20 +673,20 @@ fn generate_ortho(cams: &[Cam], verts: &[Vector3<f64>], tris: &[[usize; 3]], out
                 // cos 全为负，硬剔除会把所有像素判死（与 texture.rs 同款教训）。权重取
                 // cos²（符号无关），只按正对程度加权，不做符号剔除。
                 let cos_inc = (cam.center.z - p.z) / dist;
-                // 权重：正对度² × 图像中心径向衰减²（相邻相机重叠处自然羽化）。
+                // 权重：正对度² × 图像中心径向衰减²。本像素最终只取权值最大的那台相机
+                // （最正对/最居中），不做多相机平均，消除错位平均造成的虚影/双影。
                 let dx = (u - cam.cx) / half_w;
                 let dy = (v - cam.cy) / half_h;
                 let r2 = dx * dx + dy * dy;
                 let falloff = (1.0 - r2.min(1.0)).max(0.0);
-                let wgt = (cos_inc * cos_inc) * (falloff * falloff);
-                if wgt <= 0.0 {
+                let w0 = (cos_inc * cos_inc) * (falloff * falloff);
+                if w0 <= 0.0 {
                     continue;
                 }
-                let rgb = apply_gain(sample_rgb(&img, u, v), g);
-                for c in 0..3 {
-                    acc[idx * 4 + c] += wgt as f32 * rgb[c] as f32;
+                if w0 as f32 > best_w[idx] {
+                    best_w[idx] = w0 as f32;
+                    best_rgb[idx] = apply_gain(sample_rgb(&img, u, v), g);
                 }
-                acc[idx * 4 + 3] += wgt as f32;
                 wrote_any = true;
             }
         }
@@ -689,17 +699,88 @@ fn generate_ortho(cams: &[Cam], verts: &[Vector3<f64>], tris: &[[usize; 3]], out
         c_accumulated, c_no_footprint, c_no_depth, c_no_img
     );
 
-    // 归一化合成 RGB。
+    // 合成 RGB：每像素取权值最大的那台相机。
     let mut rgb = vec![0u8; w * h * 3];
     for p in 0..w * h {
-        let wgt = acc[p * 4 + 3];
-        if wgt > 0.0 {
+        if best_w[p] > 0.0 {
             for c in 0..3 {
-                let v = (acc[p * 4 + c] / wgt).round().clamp(0.0, 255.0);
-                rgb[p * 3 + c] = v as u8;
+                rgb[p * 3 + c] = best_rgb[p][c];
             }
         }
     }
+
+    // 去噪点 + 填黑/填白：黑像素（无相机可见）和白像素（过曝/镜面高光）都用「正常邻点」
+    // 的中值填掉；孤立杂色点也替换。黑/白条纹多迭代几遍从边缘向里填；成片无数据的区域
+    // （邻点不足）或整片白色屋顶（全是白邻点）填不动、保留。
+    let mut despeckled = 0usize;
+    for _pass in 0..DESPECKLE_PASSES {
+        let src = rgb.clone();
+        let mut changed = 0usize;
+        for j in 1..h - 1 {
+            for i in 1..w - 1 {
+                let idx = j * w + i;
+                let r0 = src[idx * 3] as i32;
+                let g0 = src[idx * 3 + 1] as i32;
+                let b0 = src[idx * 3 + 2] as i32;
+                let is_black = r0 == 0 && g0 == 0 && b0 == 0;
+                let is_white = r0 > WHITE_THRESHOLD && g0 > WHITE_THRESHOLD && b0 > WHITE_THRESHOLD;
+                // 收集「正常」邻点（非黑非白），黑白噪点都用它来填。
+                let mut med = [[0i32; 3]; 8];
+                let mut n = 0usize;
+                for dj in -1isize..=1 {
+                    for di in -1isize..=1 {
+                        if di == 0 && dj == 0 {
+                            continue;
+                        }
+                        let nidx = (j as isize + dj) as usize * w + (i as isize + di) as usize;
+                        let nr = src[nidx * 3] as i32;
+                        let ng = src[nidx * 3 + 1] as i32;
+                        let nb = src[nidx * 3 + 2] as i32;
+                        let n_black = nr == 0 && ng == 0 && nb == 0;
+                        let n_white = nr > WHITE_THRESHOLD && ng > WHITE_THRESHOLD && nb > WHITE_THRESHOLD;
+                        if !n_black && !n_white {
+                            med[n] = [nr, ng, nb];
+                            n += 1;
+                        }
+                    }
+                }
+                if n < 2 {
+                    continue; // 正常邻点太少（大片黑白区内部），填不动
+                }
+                let mut medv = [0i32; 3];
+                for c in 0..3 {
+                    let mut v = [0i32; 8];
+                    for k in 0..n {
+                        v[k] = med[k][c];
+                    }
+                    v[..n].sort_unstable();
+                    medv[c] = v[n / 2];
+                }
+                if is_black || is_white {
+                    for c in 0..3 {
+                        rgb[idx * 3 + c] = medv[c] as u8;
+                    }
+                    changed += 1;
+                } else {
+                    let diff = (r0 - medv[0]).abs() + (g0 - medv[1]).abs() + (b0 - medv[2]).abs();
+                    if diff > DESPECKLE_DIFF {
+                        for c in 0..3 {
+                            rgb[idx * 3 + c] = medv[c] as u8;
+                        }
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        despeckled += changed;
+        if changed == 0 {
+            break;
+        }
+    }
+    if despeckled > 0 {
+        println!("  despeckle: {} px replaced", despeckled);
+    }
+
     let colored = rgb
         .chunks_exact(3)
         .filter(|px| px[0] > 0 || px[1] > 0 || px[2] > 0)

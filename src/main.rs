@@ -75,11 +75,25 @@ fn parse_stage(s: &str) -> Stage {
     }
 }
 
-fn parse_args() -> (String, i32, Stage, String) {
+/// 文件修改时间（不存在或不可读返回 None）。
+fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// 文件 a 的修改时间是否严格晚于 b（用于「产物比输入新 → 跳过」的增量判断）。
+fn is_newer_than(a: &str, b: &str) -> bool {
+    match (file_mtime(a), file_mtime(b)) {
+        (Some(ta), Some(tb)) => ta > tb,
+        _ => false,
+    }
+}
+
+fn parse_args() -> (String, i32, Stage, String, bool) {
     let mut dir = String::from("./images");
     let mut out = String::from("./out");
     let mut first_octave: i32 = 0;
     let mut stage = Stage::Mvs;
+    let mut force = false;
 
     let args: Vec<String> = std::env::args().collect();
     for arg in args.iter().skip(1) {
@@ -110,71 +124,51 @@ fn parse_args() -> (String, i32, Stage, String) {
                 Some(v) => stage = parse_stage(v),
                 None => eprintln!("Missing value for -stage"),
             },
+            "-force" | "-f" => force = true,
             other => {
                 eprintln!("Unknown argument: {}", other);
             }
         }
     }
 
-    (dir, first_octave, stage, out)
+    (dir, first_octave, stage, out, force)
 }
 
-/// 从已有的 sparse.ply（稀疏点云）重建网格 → mesh.obj。
-/// 绕开 dense MVS 在平坦农田上只有中央薄层的问题：用稀疏地表（DTM）+ 检测到的建筑屋顶
-/// 抬升来重建整个拍摄区域的表面，保证房区模型能立起来。
+/// 从 dense.ply（稠密点云）重建网格 → mesh.obj。
+/// 只用 dense 做主表面源。不用 sparse 补边：sparse 在 dense 覆盖区外（图像右侧）只有少量
+/// 低质量点，硬补会把 mesh/ortho 撑出一块「异常数据」。dense 内部的覆盖空洞由 DSM 的
+/// 扩散填洞补平。
 fn build_mesh_from_dense_ply(out: &Paths) {
-    // 读 sparse.ply 的稀疏点（跳过相机中心红点 255 0 0）
-    let mut spts: Vec<(f64, f64, f64)> = Vec::new();
-    if let Ok(sp) = std::fs::read_to_string(&out.sparse_ply()) {
-        for line in sp.lines().skip(10) {
+    let mut pts: Vec<(f64, f64, f64)> = Vec::new();
+    if let Ok(ply) = std::fs::read_to_string(out.dense_ply()) {
+        for line in ply.lines().skip(10) {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 6 {
+            if parts.len() >= 3 {
                 if let (Ok(x), Ok(y), Ok(z)) = (parts[0].parse(), parts[1].parse(), parts[2].parse())
                 {
-                    if parts[3] == "255" && parts[4] == "0" && parts[5] == "0" {
-                        continue; // 相机中心
-                    }
-                    spts.push((x, y, z));
+                    pts.push((x, y, z));
                 }
             }
         }
     }
-    if spts.is_empty() {
-        eprintln!("sparse.ply 为空或不存在");
+    if pts.is_empty() {
+        eprintln!("dense.ply 为空或不存在");
         return;
     }
-    println!("\n===== Building mesh from {} sparse points =====", spts.len());
+    println!("\n===== Building mesh from {} dense points =====", pts.len());
 
-    // 检测建筑，生成密集屋顶点，把房区抬回屋顶高度
-    let buildings = crate::mesh::detect_buildings(&spts);
-    println!("  Building detection: {} buildings", buildings.len());
-    let mut mesh_pts = spts.clone();
-    for b in &buildings {
-        let step = ((b.xmax - b.xmin).max(b.ymax - b.ymin) / 40.0).max(0.01);
-        let mut x = b.xmin;
-        while x <= b.xmax {
-            let mut y = b.ymin;
-            while y <= b.ymax {
-                mesh_pts.push((x, y, b.roof));
-                y += step;
-            }
-            x += step;
-        }
-    }
-
-    // 稀疏点云用较粗网格 + min_pts=1（稀疏点每格只有零点几个，扩散填洞补全地表）
     let opts = crate::mesh::DsmOptions {
         max_side: 160,
         fill_radius: 3,
         min_pts: 1,
     };
-    crate::mesh::build_mesh_dsm(&mesh_pts, None, &opts, &out.mesh_obj());
+    crate::mesh::build_mesh_dsm(&pts, None, &opts, &out.mesh_obj());
 }
 
 fn main() {
     let total_start = Instant::now();
 
-    let (image_dir, first_octave, stage, out_dir) = parse_args();
+    let (image_dir, first_octave, stage, out_dir, force) = parse_args();
 
     backend::init();
 
@@ -217,15 +211,31 @@ fn main() {
         return;
     }
 
-    run_incremental_sfm(&matches, &features, &tracks, &paths, &out);
+    // SfM 增量跳过：sparse.ply + camera_poses.json 都比 matches 缓存新（说明 SfM 已跑过、
+    // matches 没变），跳过 SfM。`-force` 强制重跑。
+    let sfm_fresh = !force
+        && is_newer_than(&out.sparse_ply(), &out.matches_cache_dir())
+        && is_newer_than(&out.camera_poses_json(), &out.matches_cache_dir());
+    if sfm_fresh {
+        println!("  [skip] SfM: sparse.ply/camera_poses.json 已是最新（-force 强制重跑）");
+    } else {
+        run_incremental_sfm(&matches, &features, &tracks, &paths, &out);
+    }
     if stage <= Stage::Sfm {
         let total_elapsed = total_start.elapsed();
         println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());
         return;
     }
 
-    // MVS Dense Reconstruction
-    run_mvs_dense(&paths, &out);
+    // MVS 增量跳过：dense.ply 比 camera_poses.json + sparse.ply 都新 → 跳过 MVS（1.5h 重活）。
+    let mvs_fresh = !force
+        && is_newer_than(&out.dense_ply(), &out.camera_poses_json())
+        && is_newer_than(&out.dense_ply(), &out.sparse_ply());
+    if mvs_fresh {
+        println!("  [skip] MVS: dense.ply 已是最新（-force 强制重跑）");
+    } else {
+        run_mvs_dense(&paths, &out);
+    }
     if stage <= Stage::Mvs {
         let total_elapsed = total_start.elapsed();
         println!("\nTotal time: {:.2}s", total_elapsed.as_secs_f32());

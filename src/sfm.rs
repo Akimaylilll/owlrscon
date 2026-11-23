@@ -70,6 +70,17 @@ const MAX_GROW_IMAGES: usize = 6;
 // 把山坡起伏一起转掉、压扁 z（实测 z 从 94m 压到 40m），先置 false 验证 z 是否恢复。
 const ENABLE_LEVELING: bool = false;
 
+// GPS 先验（可选）：有 ≥GPS_MIN_ANCHORS 个带 GPS 的已注册相机时，在全局 BA 里加软约束，
+// 把相机中心拉向 EXIF GPS 的 ENU 米制位置，同时给重建一个米制尺度。σ 越小先验越强。
+// 无 GPS 时完全不参与，重建走原来的任意尺度 + RMS 归一。
+const GPS_MIN_ANCHORS: usize = 3;
+const GPS_PRIOR_SIGMA_XY_M: f64 = 1.0;
+const GPS_PRIOR_SIGMA_Z_M: f64 = 1.0;
+
+// 姿态先验自检：ENU 对齐后，重建旋转 vs XMP 姿态的中位角度残差超过该阈值（度）就跳过姿态
+// 先验（说明 yaw/pitch/roll 的轴序/符号约定或数据不一致，硬拉会损坏重建）。
+const ATT_PRIOR_MAX_INIT_RESIDUAL_DEG: f64 = 30.0;
+
 const ABS_POSE_MIN_NUM_INLIERS: usize = 30;
 const ABS_POSE_MAX_ERROR_PX: f64 = 12.0;
 const ABS_POSE_MIN_INLIER_RATIO: f64 = 0.25;
@@ -347,8 +358,6 @@ fn read_exif_focal_length_35mm(data: &[u8]) -> Option<f64> {
 /// 读取 EXIF GPS（纬度/经度/海拔），返回 `(lat_deg, lon_deg, alt_m)`。无 GPS 时返回 `None`。
 /// 解析 GPS IFD（EXIF 0x8825 指向），读 GPSLatitude(0x0002)/GPSLongitude(0x0004)（3 个
 /// RATIONAL：度/分/秒）与 GPSAltitude(0x0006)，并处理 N/S、E/W 符号。
-/// 当前未启用（用户要求不依赖 GPS），保留供可选米制对齐参考。
-#[allow(dead_code)]
 fn read_exif_gps(data: &[u8]) -> Option<(f64, f64, f64)> {
     let mut pos = 0;
     while pos + 4 < data.len() {
@@ -472,6 +481,148 @@ fn read_exif_gps(data: &[u8]) -> Option<(f64, f64, f64)> {
         lon = -lon;
     }
     Some((lat, lon, alt.unwrap_or(0.0)))
+}
+
+/// GPS 先验数据：每张图的 ENU 米制目标位置（None = 无 GPS）。`count` 为有 GPS 的图数。
+struct GpsData {
+    enu: Vec<Option<Vector3<f64>>>,
+    count: usize,
+}
+
+/// 从所有图片 EXIF 读 GPS，转成以平均经纬度为原点的 ENU（东/北/上，米）。
+/// 少于 `GPS_MIN_ANCHORS` 张有 GPS 时返回全 None（调用方走无 GPS 路径）。
+fn build_gps_enu(paths: &[String]) -> GpsData {
+    let n = paths.len();
+    let mut raw: Vec<Option<(f64, f64, f64)>> = vec![None; n];
+    let mut lats: Vec<f64> = Vec::new();
+    let mut lons: Vec<f64> = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        if let Ok(data) = fs::read(p) {
+            if let Some((lat, lon, alt)) = read_exif_gps(&data) {
+                raw[i] = Some((lat, lon, alt));
+                lats.push(lat);
+                lons.push(lon);
+            }
+        }
+    }
+    if lats.len() < GPS_MIN_ANCHORS {
+        return GpsData {
+            enu: vec![None; n],
+            count: lats.len(),
+        };
+    }
+    let lat0 = lats.iter().sum::<f64>() / lats.len() as f64;
+    let lon0 = lons.iter().sum::<f64>() / lons.len() as f64;
+    let m_lat = 111_320.0;
+    let m_lon = 111_320.0 * lat0.to_radians().cos();
+    let enu = raw
+        .into_iter()
+        .map(|g| {
+            g.map(|(lat, lon, alt)| {
+                Vector3::new((lon - lon0) * m_lon, (lat - lat0) * m_lat, alt)
+            })
+        })
+        .collect();
+    GpsData { enu, count: lats.len() }
+}
+
+// ---------------------------------------------------------------------
+//  XMP 相机姿态（yaw/pitch/roll）
+// ---------------------------------------------------------------------
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// 在 XMP 字节流里找 `key="<数字>"` 属性并解析成 f64。
+fn xmp_attr_f64(xmp: &[u8], key: &str) -> Option<f64> {
+    let needle = format!("{}=\"", key);
+    let pos = find_subslice(xmp, needle.as_bytes())?;
+    let start = pos + needle.len();
+    let end = start + find_subslice(&xmp[start..], b"\"")?;
+    std::str::from_utf8(&xmp[start..end]).ok()?.trim().parse::<f64>().ok()
+}
+
+struct XmpAttitude {
+    yaw: f64,
+    pitch: f64,
+    roll: f64,
+    yaw_sigma: f64,
+    pitch_sigma: f64,
+    roll_sigma: f64,
+}
+
+/// 从图片 XMP 读相机姿态角（度）与每轴 IMU 精度（度）。无 XMP/无标签时返回 None。
+/// senseFly/Pix4D 的 XMP 形如 `Camera:Yaw="96.03" Camera:Pitch="..." Camera:Roll="..."`，
+/// 精度为 `Camera:IMUYawAccuracy` / `IMUPitchAccuracy` / `IMURollAccuracy`。
+fn read_xmp_attitude(data: &[u8]) -> Option<XmpAttitude> {
+    let marker = b"http://ns.adobe.com/xap/1.0/\x00";
+    let i = find_subslice(data, marker)?;
+    let end = (i + 65536).min(data.len());
+    let xmp = &data[i..end];
+    let yaw = xmp_attr_f64(xmp, "Camera:Yaw")?;
+    let pitch = xmp_attr_f64(xmp, "Camera:Pitch")?;
+    let roll = xmp_attr_f64(xmp, "Camera:Roll")?;
+    let yaw_sigma = xmp_attr_f64(xmp, "Camera:IMUYawAccuracy").unwrap_or(10.0);
+    let pitch_sigma = xmp_attr_f64(xmp, "Camera:IMUPitchAccuracy").unwrap_or(5.0);
+    let roll_sigma = xmp_attr_f64(xmp, "Camera:IMURollAccuracy").unwrap_or(5.0);
+    Some(XmpAttitude {
+        yaw,
+        pitch,
+        roll,
+        yaw_sigma,
+        pitch_sigma,
+        roll_sigma,
+    })
+}
+
+/// senseFly/Pix4D `Camera:Yaw/Pitch/Roll`（度）→ 世界(ENU: x=东,y=北,z=上)→相机 旋转矩阵。
+/// 约定：yaw 从北顺时针（东=90°）；pitch/roll 为绕机体横/纵轴的小倾角。基线（全 0）正射向下
+/// R = diag(1,-1,-1)。组合：R = diag(1,-1,-1) · Rz(yaw) · Ry(pitch) · Rx(roll)。
+///
+/// 注意：Pix4D 的 yaw/pitch/roll → 旋转有厂商轴序/符号差异；本函数取最常见约定，配合
+/// `ATT_PRIOR_MAX_INIT_RESIDUAL_DEG` 自检（残差过大自动跳过）使用，跑一次即可从日志判断对错。
+fn yaw_pitch_roll_to_r(yaw_deg: f64, pitch_deg: f64, roll_deg: f64) -> Matrix3<f64> {
+    let (sy, cy) = yaw_deg.to_radians().sin_cos();
+    let (sp, cp) = pitch_deg.to_radians().sin_cos();
+    let (sr, cr) = roll_deg.to_radians().sin_cos();
+    let rz = Matrix3::new(cy, -sy, 0.0, sy, cy, 0.0, 0.0, 0.0, 1.0);
+    let ry = Matrix3::new(cp, 0.0, sp, 0.0, 1.0, 0.0, -sp, 0.0, cp);
+    let rx = Matrix3::new(1.0, 0.0, 0.0, 0.0, cr, -sr, 0.0, sr, cr);
+    let base = Matrix3::new(1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0);
+    base * rz * ry * rx
+}
+
+/// 姿态先验数据：每张图的 XMP 姿态 → 世界(ENU)→相机旋转目标 + 每轴 σ（弧度，世界帧）。
+struct AttitudeData {
+    r: Vec<Option<Matrix3<f64>>>,
+    sigma: Vec<Option<Vector3<f64>>>,
+    count: usize,
+}
+
+/// 从所有图片 XMP 读 yaw/pitch/roll，转成 ENU 世界系的旋转目标。无姿态的图为 None。
+fn build_attitude(paths: &[String]) -> AttitudeData {
+    let n = paths.len();
+    let mut r = vec![None; n];
+    let mut sigma = vec![None; n];
+    let mut count = 0usize;
+    for (i, p) in paths.iter().enumerate() {
+        if let Ok(data) = fs::read(p) {
+            if let Some(a) = read_xmp_attitude(&data) {
+                r[i] = Some(yaw_pitch_roll_to_r(a.yaw, a.pitch, a.roll));
+                // 世界帧 σ（弧度）：近正射下 yaw≈绕世界 z（上）轴，pitch/roll≈绕水平轴。
+                sigma[i] = Some(Vector3::new(
+                    a.pitch_sigma.to_radians(),
+                    a.roll_sigma.to_radians(),
+                    a.yaw_sigma.to_radians(),
+                ));
+                count += 1;
+            }
+        }
+    }
+    AttitudeData { r, sigma, count }
 }
 
 fn img_file_stem(path: &str) -> String {
@@ -1212,6 +1363,13 @@ struct Sfm {
     track_to_point: BTreeMap<usize, usize>,
     reg_trials: Vec<usize>,
     filtered: Vec<bool>,
+    // 每张图的 GPS ENU 目标（米，None = 无 GPS）。仅在最终 GPS 精修阶段被填充；子模型阶段为全 None，
+    // 因此 grow/merge 期间的全局 BA 不会吃到 GPS 先验（避免干扰脆弱的增量重建）。
+    gps_enu: Vec<Option<Vector3<f64>>>,
+    // 姿态先验：XMP yaw/pitch/roll → 世界(ENU)→相机旋转目标 + 每轴 σ（弧度）。同 gps_enu，
+    // 仅最终阶段填充；子模型阶段为全 None。
+    att_r: Vec<Option<Matrix3<f64>>>,
+    att_sigma: Vec<Option<Vector3<f64>>>,
 }
 
 impl Sfm {
@@ -1228,6 +1386,9 @@ impl Sfm {
             track_to_point: BTreeMap::new(),
             reg_trials: vec![0; num_images],
             filtered: vec![false; num_images],
+            gps_enu: vec![None; num_images],
+            att_r: vec![None; num_images],
+            att_sigma: vec![None; num_images],
         }
     }
 
@@ -2617,6 +2778,83 @@ fn bundle_adjust(
             }
         }
 
+        // GPS 软先验：把带 GPS 的相机中心拉向其 ENU 目标（米）。只在 sfm.gps_enu 有值时
+        // 生效——grow/merge 阶段子模型该字段为全 None，不会干扰脆弱的增量重建。先验只进
+        // 法方程（u/ec）塑形步长方向，不参与下方 new_cost 的接受判断：接受仍以重投影误差
+        // 为准，避免 GPS 压过观测数据。
+        if sfm.gps_enu.iter().any(|g| g.is_some()) {
+            let wx = 1.0 / (GPS_PRIOR_SIGMA_XY_M * GPS_PRIOR_SIGMA_XY_M);
+            let wy = 1.0 / (GPS_PRIOR_SIGMA_XY_M * GPS_PRIOR_SIGMA_XY_M);
+            let wz = 1.0 / (GPS_PRIOR_SIGMA_Z_M * GPS_PRIOR_SIGMA_Z_M);
+            for ci in 0..nc {
+                let im = active_cams[ci];
+                let Some(g) = sfm.gps_enu[im] else { continue; };
+                let cam = sfm.cameras[im].as_ref().unwrap();
+                // 相机中心 C = -R^T t；dC/dw = -R^T skew(t)，dC/dt = -R^T，dC/df = 0
+                let center = camera_center(&cam.r, &cam.t);
+                let rg = center - g;
+                let rt = cam.r.transpose();
+                let jw = -rt * skew_symmetric(&cam.t);
+                let jt = -rt;
+                let mut jg = na::SMatrix::<f64, 3, 7>::zeros();
+                for r in 0..3 {
+                    for c in 0..3 {
+                        jg[(r, c)] = jw[(r, c)];
+                        jg[(r, 3 + c)] = jt[(r, c)];
+                    }
+                }
+                let wr = na::Vector3::new(wx * rg.x, wy * rg.y, wz * rg.z);
+                for r in 0..7 {
+                    for c in 0..7 {
+                        let mut acc = 0.0f64;
+                        for k in 0..3 {
+                            let wk = if k == 0 {
+                                wx
+                            } else if k == 1 {
+                                wy
+                            } else {
+                                wz
+                            };
+                            acc += jg[(k, r)] * jg[(k, c)] * wk;
+                        }
+                        u[ci][(r, c)] += acc;
+                    }
+                    let mut acc = 0.0f64;
+                    for k in 0..3 {
+                        acc += jg[(k, r)] * wr[k];
+                    }
+                    ec[ci][r] += acc;
+                }
+            }
+        }
+
+        // 姿态软先验：把相机旋转拉向 XMP 姿态（ENU 世界系）。同 GPS 先验：只在 att_r 有值时
+        // 生效、只进法方程不进接受判断。残差 r = so3_log(R_i R_t^T)（世界帧，弧度），一阶 J≈I，
+        // 权重按每轴 σ（σ 来自 XMP 精度字段）。
+        if sfm.att_r.iter().any(|r| r.is_some()) {
+            for ci in 0..nc {
+                let im = active_cams[ci];
+                let Some(rt_target) = sfm.att_r[im] else { continue; };
+                let Some(sigma) = sfm.att_sigma[im] else { continue; };
+                let cam = sfm.cameras[im].as_ref().unwrap();
+                let r = so3_log(&(cam.r * rt_target.transpose()));
+                let wx = 1.0 / (sigma.x * sigma.x).max(1e-6);
+                let wy = 1.0 / (sigma.y * sigma.y).max(1e-6);
+                let wz = 1.0 / (sigma.z * sigma.z).max(1e-6);
+                for k in 0..3 {
+                    let w = if k == 0 {
+                        wx
+                    } else if k == 1 {
+                        wy
+                    } else {
+                        wz
+                    };
+                    u[ci][(k, k)] += w;
+                    ec[ci][k] += w * r[k];
+                }
+            }
+        }
+
         let cost = total_cost / nobs.max(1) as f64;
         if _it == 0 {
             best_cost = cost;
@@ -3659,51 +3897,34 @@ fn build_correspondence_index(matches: &[Match]) -> HashMap<(usize, usize), Vec<
     map
 }
 
-/// 可选：用图片 EXIF GPS 把重建对齐到米制 ENU（东/北/高）。
+/// 可选：用 GPS 把重建粗对齐到米制 ENU（东/北/高）。
 ///
-/// 不依赖 GPS 的通用路径照常工作：有 ≥3 张带 GPS 的已注册相机才做 Umeyama 相似变换
-/// （尺度+旋转+平移），把相机中心对齐到 GPS ENU 坐标，从而给重建一个米制尺度；无 GPS
-/// 时跳过，输出仍为任意尺度。这是纯后处理（一个全局相似变换），不影响 SfM 结构本身。
-#[allow(dead_code)]
-fn align_to_gps(sfm: &mut Sfm, paths: &[String]) {
-    let mut gps: Vec<Option<(f64, f64, f64)>> = vec![None; sfm.num_images];
-    let mut lats: Vec<f64> = Vec::new();
-    let mut lons: Vec<f64> = Vec::new();
-    for (i, p) in paths.iter().enumerate() {
-        if let Ok(data) = fs::read(p) {
-            if let Some((lat, lon, alt)) = read_exif_gps(&data) {
-                gps[i] = Some((lat, lon, alt));
-                lats.push(lat);
-                lons.push(lon);
-            }
-        }
-    }
-    if lats.len() < 3 {
-        println!("  GPS align: only {} images have GPS (<3), keep arbitrary scale", lats.len());
-        return;
-    }
-    let lat0 = lats.iter().sum::<f64>() / lats.len() as f64;
-    let lon0 = lons.iter().sum::<f64>() / lons.len() as f64;
-    let m_lat = 111320.0;
-    let m_lon = 111320.0 * lat0.to_radians().cos();
-
+/// 有 ≥GPS_MIN_ANCHORS 个带 GPS 的已注册相机才做 Umeyama 相似变换（尺度+旋转+平移），
+/// 把相机中心对齐到 GPS ENU 坐标，给重建一个米制尺度；不足或 Umeyama 退化时返回 false、
+/// 不改变 sfm，调用方回退到任意尺度 + RMS 归一。这是纯后处理（一个全局相似变换），
+/// 不改变 SfM 结构本身。
+fn align_to_gps(sfm: &mut Sfm, gps: &GpsData) -> bool {
     let mut src: Vec<Vector3<f64>> = Vec::new();
     let mut dst: Vec<Vector3<f64>> = Vec::new();
     for (i, cam) in sfm.cameras.iter().enumerate() {
-        if let (Some(cam), Some((lat, lon, alt))) = (cam, gps[i]) {
+        if let (Some(cam), Some(g)) = (cam, gps.enu[i]) {
             src.push(camera_center(&cam.r, &cam.t));
-            dst.push(Vector3::new((lon - lon0) * m_lon, (lat - lat0) * m_lat, alt));
+            dst.push(g);
         }
     }
-    if src.len() < 3 {
-        println!("  GPS align: only {} registered cams have GPS, skip", src.len());
-        return;
+    if src.len() < GPS_MIN_ANCHORS {
+        println!(
+            "  GPS align: only {} registered cams have GPS (<{}), keep arbitrary scale",
+            src.len(),
+            GPS_MIN_ANCHORS
+        );
+        return false;
     }
     let (scale, rot, trans) = match umeyama_sim3(&src, &dst) {
         Some(v) => v,
         None => {
             println!("  GPS align: Umeyama degenerate, skip");
-            return;
+            return false;
         }
     };
 
@@ -3722,6 +3943,7 @@ fn align_to_gps(sfm: &mut Sfm, paths: &[String]) {
         src.len(),
         scale
     );
+    true
 }
 
 pub(crate) fn run_incremental_sfm(
@@ -3755,6 +3977,22 @@ pub(crate) fn run_incremental_sfm(
     println!("Correspondence graph: {} image pairs", index.len(),);
 
     let mut sfm = Sfm::new(paths.len(), intrinsics);
+    let gps_data = build_gps_enu(paths);
+    if gps_data.count >= GPS_MIN_ANCHORS {
+        println!("  GPS: {} images have EXIF GPS (prior enabled)", gps_data.count);
+    } else {
+        println!(
+            "  GPS: {} images have EXIF GPS (<{}), running without GPS prior",
+            gps_data.count, GPS_MIN_ANCHORS
+        );
+    }
+    let attitude = build_attitude(paths);
+    if attitude.count > 0 {
+        println!(
+            "  Attitude: {} images have XMP yaw/pitch/roll (prior candidate)",
+            attitude.count
+        );
+    }
     reconstruct_multi_model(&mut sfm, &index, features, tracks, paths);
 
     // 补注册：暂禁用（怀疑其 grow_sub_model 触发的 BA 把尺度重新缩塌，见 2026-11-17 诊断）。
@@ -3794,10 +4032,62 @@ pub(crate) fn run_incremental_sfm(
         println!("  Sanitized {} wild camera(s)", fixed);
     }
 
-    // 约定尺度归一化：把相机轨迹的 RMS 半径归一到 1（同时平移使相机质心回到原点）。
-    // 单目 SfM 的绝对尺度不可观测，用这个确定性约定让不同运行的输出数值稳定、可比较
-    // （不用 GPS、不改变结构，只做全局相似变换）。
-    {
+    // 有 GPS：先 Umeyama 粗对齐到米制 ENU，再以 GPS 为软先验跑一轮全局 BA 精修（拉相机
+    // 中心到 ENU 位置、消除残差漂移/尺度漂移），最终保持米制。无 GPS（或对齐失败）：保持
+    // 原来的 RMS 归一约定（任意尺度），行为与之前完全一致。
+    let gps_aligned = if gps_data.count >= GPS_MIN_ANCHORS {
+        align_to_gps(&mut sfm, &gps_data)
+    } else {
+        false
+    };
+    if gps_aligned {
+        sfm.gps_enu = gps_data.enu.clone();
+
+        // 姿态先验自检：对齐到 ENU 后，比较重建旋转与 XMP 姿态的角度残差。中位残差过大说明
+        // yaw/pitch/roll 约定（轴序/符号）或数据不一致，跳过姿态先验，避免把重建拉坏。
+        {
+            let mut resid: Vec<f64> = Vec::new();
+            for (i, cam) in sfm.cameras.iter().enumerate() {
+                if let (Some(cam), Some(rt)) = (cam, attitude.r[i]) {
+                    resid.push(so3_log(&(cam.r * rt.transpose())).norm().to_degrees());
+                }
+            }
+            let n_att = resid.len();
+            if n_att >= GPS_MIN_ANCHORS {
+                resid.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = resid[n_att / 2];
+                let mx = resid[n_att - 1];
+                println!(
+                    "  Attitude prior: {} images, init angular residual median={:.1}° max={:.1}°",
+                    n_att, med, mx
+                );
+                if med <= ATT_PRIOR_MAX_INIT_RESIDUAL_DEG {
+                    sfm.att_r = attitude.r.clone();
+                    sfm.att_sigma = attitude.sigma.clone();
+                } else {
+                    println!(
+                        "  Attitude prior: median residual {:.1}° > {:.1}°, SKIP (check yaw/pitch/roll convention)",
+                        med, ATT_PRIOR_MAX_INIT_RESIDUAL_DEG
+                    );
+                }
+            }
+        }
+
+        let n_anchor = sfm
+            .cameras
+            .iter()
+            .enumerate()
+            .filter(|&(i, c)| c.is_some() && sfm.gps_enu[i].is_some())
+            .count();
+        sfm.iterative_refinement(tracks, features, true, None);
+        println!(
+            "  GPS prior BA: refined with {} anchors (σ_xy={:.1}m σ_z={:.1}m)",
+            n_anchor, GPS_PRIOR_SIGMA_XY_M, GPS_PRIOR_SIGMA_Z_M
+        );
+    } else {
+        // 约定尺度归一化：把相机轨迹的 RMS 半径归一到 1（同时平移使相机质心回到原点）。
+        // 单目 SfM 的绝对尺度不可观测，用这个确定性约定让不同运行的输出数值稳定、可比较
+        // （不用 GPS、不改变结构，只做全局相似变换）。
         let centers: Vec<Vector3<f64>> = sfm
             .cameras
             .iter()
@@ -4266,10 +4556,11 @@ fn save_sparse_reconstruction(
 
     fs::write(out.sparse_ply(), &ply).unwrap();
 
+    let gps_aligned = sfm.gps_enu.iter().any(|g| g.is_some());
     let mut jposes: Vec<serde_json::Value> = Vec::new();
     for (i, cam) in sfm.cameras.iter().enumerate() {
         if let Some(c) = cam {
-            jposes.push(serde_json::json!({
+            let mut j = serde_json::json!({
                 "image": std::path::Path::new(&paths[i]).file_stem().unwrap().to_str().unwrap(),
                 "f": sfm.focals[i],
                 "cx": sfm.cx(),
@@ -4278,13 +4569,18 @@ fn save_sparse_reconstruction(
                       [c.r[(1,0)], c.r[(1,1)], c.r[(1,2)]],
                       [c.r[(2,0)], c.r[(2,1)], c.r[(2,2)]]],
                 "t": [c.t.x, c.t.y, c.t.z],
-            }));
+            });
+            if let Some(g) = sfm.gps_enu[i] {
+                j["gps_z"] = serde_json::json!(g.z);
+            }
+            jposes.push(j);
         }
     }
     let jdata = serde_json::json!({
         "num_images": sfm.num_images,
         "num_registered": num_registered,
         "num_points": valid_pts.len(),
+        "gps_aligned": gps_aligned,
         "poses": jposes,
     });
     fs::write(
